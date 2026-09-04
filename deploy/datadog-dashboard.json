@@ -1,0 +1,54 @@
+{
+  "title": "Consistent RPC Proxy",
+  "description": "Freshness, consistency, upstream health, and WebSocket recovery for rpc-proxy.",
+  "layout_type": "ordered",
+  "template_variables": [
+    {"name": "env", "prefix": "env", "default": "*"},
+    {"name": "chain", "prefix": "chain", "default": "*"}
+  ],
+  "widgets": [
+    {"definition": {"type": "timeseries", "title": "Requests and errors", "requests": [
+      {"q": "sum:rpc_proxy.request{env:$env,chain:$chain}.as_rate()", "display_type": "line"},
+      {"q": "sum:rpc_proxy.request{env:$env,chain:$chain,outcome:error}.as_rate()", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Request and pin latency p99", "requests": [
+      {"q": "p99:rpc_proxy.request.duration{env:$env,chain:$chain}", "display_type": "line"},
+      {"q": "p99:rpc_proxy.pin.wait{env:$env,chain:$chain}", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Accepted head age", "requests": [
+      {"q": "max:rpc_proxy.head.age{env:$env,chain:$chain} by {commitment}", "display_type": "line"},
+      {"q": "max:rpc_proxy.head.stuck_age{env:$env,chain:$chain} by {commitment}", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Consistency failures and reorgs", "requests": [
+      {"q": "sum:rpc_proxy.consistency.failure{env:$env,chain:$chain} by {failure_class}.as_count()", "display_type": "bars"},
+      {"q": "sum:rpc_proxy.head.reorg{env:$env,chain:$chain}.as_count()", "display_type": "bars"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Upstream latency", "requests": [
+      {"q": "p95:rpc_proxy.upstream.request.duration{env:$env,chain:$chain} by {upstream}", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Upstream outcomes (including protocol failures)", "requests": [
+      {"q": "sum:rpc_proxy.upstream.request{env:$env,chain:$chain} by {upstream,outcome}.as_rate()", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Provider head lag", "requests": [
+      {"q": "max:rpc_proxy.provider.head_lag{env:$env,chain:$chain} by {upstream,commitment}", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Redis and routing failures", "requests": [
+      {"q": "sum:rpc_proxy.redis.failure{env:$env,chain:$chain} by {operation}.as_count()", "display_type": "bars"},
+      {"q": "sum:rpc_proxy.routing.failover{env:$env,chain:$chain} by {upstream}.as_count()", "display_type": "bars"},
+      {"q": "sum:rpc_proxy.routing.retry{env:$env,chain:$chain} by {upstream}.as_count()", "display_type": "bars"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Upstream subscriptions", "requests": [
+      {"q": "max:rpc_proxy.coordinator.subscription_active{env:$env,chain:$chain} by {upstream}", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Latest HTTP fallback and subscription failures", "requests": [
+      {"q": "sum:rpc_proxy.coordinator.latest_poll{env:$env,chain:$chain} by {upstream}.as_rate()", "display_type": "line"},
+      {"q": "sum:rpc_proxy.coordinator.subscription_error{env:$env,chain:$chain} by {upstream,failure_class}.as_rate()", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "WebSocket recovery", "requests": [
+      {"q": "sum:rpc_proxy.ws.upstream_failover{env:$env,chain:$chain}.as_count()", "display_type": "bars"},
+      {"q": "sum:rpc_proxy.ws.backfilled_heads{env:$env,chain:$chain}.as_count()", "display_type": "bars"},
+      {"q": "sum:rpc_proxy.ws.recovery_failure{env:$env,chain:$chain}.as_count()", "display_type": "bars"},
+      {"q": "sum:rpc_proxy.ws.slow_client_disconnect{env:$env,chain:$chain}.as_count()", "display_type": "bars"}
+    ]}}
+  ]
+}

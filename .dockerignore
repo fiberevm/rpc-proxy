@@ -1,0 +1,8 @@
+.git
+.env
+.env.*
+.DS_Store
+bin
+coverage.out
+rpc-proxy.yaml
+*.prof

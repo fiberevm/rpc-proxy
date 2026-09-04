@@ -1,0 +1,8 @@
+/bin/
+/coverage.out
+/.env
+/.env.*
+!/.env.example
+.DS_Store
+/rpc-proxy.yaml
+*.prof
