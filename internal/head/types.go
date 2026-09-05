@@ -22,19 +22,26 @@ var ErrLeadershipLost = errors.New("head coordinator leadership lost")
 // ErrStreamGap means the consumer's checkpoint is no longer retained.
 var ErrStreamGap = errors.New("accepted head stream checkpoint is no longer retained")
 
+// ErrReorgFence means a publication did not acknowledge the current reorg epoch.
+var ErrReorgFence = errors.New("accepted head reorg fence changed")
+
 // Head is one verified EVM block or Solana slot accepted for a commitment level.
 type Head struct {
-	Chain      string          `json:"chain"`
-	Family     string          `json:"family"`
-	Commitment string          `json:"commitment"`
-	Number     uint64          `json:"number"`
-	Hash       string          `json:"hash,omitempty"`
-	ParentHash string          `json:"parent_hash,omitempty"`
-	Generation uint64          `json:"generation"`
-	ObservedAt time.Time       `json:"observed_at"`
-	ChangedAt  time.Time       `json:"changed_at"`
-	Origin     string          `json:"origin"`
-	Header     json.RawMessage `json:"header,omitempty"`
+	Chain      string `json:"chain"`
+	Family     string `json:"family"`
+	Commitment string `json:"commitment"`
+	Number     uint64 `json:"number"`
+	Hash       string `json:"hash,omitempty"`
+	ParentHash string `json:"parent_hash,omitempty"`
+	Generation uint64 `json:"generation"`
+	// ReorgEpoch changes before fork recovery, not on ordinary head advancement.
+	ReorgEpoch uint64 `json:"reorg_epoch"`
+	// ReorgPending survives leadership changes and blocks pinned reads until verified recovery.
+	ReorgPending bool            `json:"reorg_pending"`
+	ObservedAt   time.Time       `json:"observed_at"`
+	ChangedAt    time.Time       `json:"changed_at"`
+	Origin       string          `json:"origin"`
+	Header       json.RawMessage `json:"header,omitempty"`
 }
 
 // Identity returns the hash identity for EVM or the commitment-and-slot identity for Solana.
@@ -72,6 +79,7 @@ type Store interface {
 	Renew(ctx context.Context, chain, token string, ttl time.Duration) (bool, error)
 	Release(ctx context.Context, chain, token string) error
 	Publish(ctx context.Context, token string, acceptedHead Head) (Head, error)
+	BeginReorg(ctx context.Context, chain, token string) (Head, error)
 	Snapshot(ctx context.Context, chain string) (Snapshot, error)
 	StreamCursor(ctx context.Context, chain string) (string, error)
 	StreamStart(ctx context.Context, chain string) (Event, error)
@@ -151,6 +159,9 @@ func (m *MemoryStore) Publish(_ context.Context, token string, acceptedHead Head
 		m.heads[acceptedHead.Chain] = map[string]Head{}
 	}
 	previous, exists := m.heads[acceptedHead.Chain][acceptedHead.Commitment]
+	if acceptedHead.Family == "evm" && acceptedHead.Commitment == Latest && (acceptedHead.ReorgPending || acceptedHead.ReorgEpoch != previous.ReorgEpoch) {
+		return Head{}, ErrReorgFence
+	}
 	if exists && previous.Identity() == acceptedHead.Identity() {
 		acceptedHead.Generation = previous.Generation
 		acceptedHead.ChangedAt = previous.ChangedAt
@@ -169,6 +180,26 @@ func (m *MemoryStore) Publish(_ context.Context, token string, acceptedHead Head
 	close(m.notify)
 	m.notify = make(chan struct{})
 	return acceptedHead, nil
+}
+
+// BeginReorg fences readers before fork recovery; only the current chain leader may advance the epoch.
+func (m *MemoryStore) BeginReorg(_ context.Context, chain, token string) (Head, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	leader := m.leaders[chain]
+	if leader.token != token || !time.Now().Before(leader.expires) {
+		return Head{}, ErrLeadershipLost
+	}
+	current, exists := m.heads[chain][Latest]
+	if !exists || current.Family != "evm" || current.IsZero() {
+		return Head{}, ErrReorgFence
+	}
+	if !current.ReorgPending {
+		current.ReorgEpoch++
+		current.ReorgPending = true
+		m.heads[chain][Latest] = current
+	}
+	return current, nil
 }
 
 // Set installs a head without fencing for deterministic test and embedded setup.

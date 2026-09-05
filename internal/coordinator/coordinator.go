@@ -52,6 +52,17 @@ type Options struct {
 
 type observation struct{ head head.Head }
 
+type evmTransitionRequest struct {
+	current      head.Head
+	candidate    head.Head
+	onDivergence func() error
+}
+
+type canonicalEvidence struct {
+	observed   bool
+	allCurrent bool
+}
+
 // NewCoordinator creates a fenced per-chain head coordinator with injected storage and telemetry.
 func NewCoordinator(options Options) *Coordinator {
 	return &Coordinator{
@@ -227,6 +238,23 @@ func (c *Coordinator) poll(ctx context.Context, output chan<- observation, commi
 			select {
 			case output <- observation{head: selected}:
 			case <-ctx.Done():
+				return
+			}
+			// Do not hide an equal-height fork behind the preferred head. Every distinct
+			// EVM observation must reach fork detection, including HTTP fallback polls.
+			if c.runtime.Config.Family == "evm" {
+				seen := map[string]bool{selected.Identity(): true}
+				for _, candidate := range candidates {
+					if seen[candidate.Identity()] {
+						continue
+					}
+					seen[candidate.Identity()] = true
+					select {
+					case output <- observation{head: candidate}:
+					case <-ctx.Done():
+						return
+					}
+				}
 			}
 		}()
 	}
@@ -318,23 +346,62 @@ func (c *Coordinator) consider(ctx context.Context, token string, candidate head
 		// A lagging observation cannot lower a previously promised slot floor.
 		return nil
 	}
-	if candidate.Family == "evm" && exists && candidate.Hash != current.Hash {
-		if candidate.Number <= current.Number {
-			observed, err := c.currentStillObserved(ctx, current)
+	if candidate.Family == "evm" && exists {
+		if strings.EqualFold(candidate.Hash, current.Hash) {
+			if current.ReorgPending {
+				evidence, err := c.getCanonicalEvidence(ctx, current)
+				if err != nil {
+					return err
+				}
+				if !evidence.allCurrent {
+					return nil
+				}
+			}
+		} else {
+			transition := evmTransitionRequest{current: current, candidate: candidate, onDivergence: func() error {
+				if current.ReorgPending {
+					return nil
+				}
+				redisCtx, finish := c.telemetry.Span(ctx, "redis.begin_reorg", "chain:"+candidate.Chain, "operation:begin_reorg")
+				guarded, err := c.store.BeginReorg(redisCtx, candidate.Chain, token)
+				finish(err)
+				if err != nil {
+					c.telemetry.Count("redis.failure", 1, "chain:"+candidate.Chain, "operation:begin_reorg")
+					return err
+				}
+				current = guarded
+				c.telemetry.Count("head.reorg_detected", 1, "chain:"+candidate.Chain)
+				c.telemetry.Gauge("head.reorg_pending", 1, "chain:"+candidate.Chain)
+				c.logger.Warn("EVM reorg detected; pinned reads fenced", "chain", candidate.Chain, "reorg_epoch", guarded.ReorgEpoch)
+				return nil
+			}}
+			reorg, err := c.validateEVMTransition(ctx, transition)
 			if err != nil {
 				return err
 			}
-			if observed {
-				return nil
+			if candidate.Number <= current.Number {
+				if !reorg {
+					return nil // A verified ancestor is a lagging observation, not a new fork.
+				}
+				evidence, err := c.getCanonicalEvidence(ctx, current)
+				if err != nil {
+					return err
+				}
+				if evidence.observed {
+					if !evidence.allCurrent {
+						return nil // Keep the head, but keep reads fenced while providers disagree.
+					}
+					candidate = current
+					candidate.ObservedAt = time.Now().UTC()
+				}
+			}
+			if reorg && !strings.EqualFold(candidate.Hash, current.Hash) {
+				c.telemetry.Count("head.reorg", 1, "chain:"+candidate.Chain)
 			}
 		}
-		reorg, err := c.validateEVMTransition(ctx, current, candidate)
-		if err != nil {
-			return err
-		}
-		if reorg {
-			c.telemetry.Count("head.reorg", 1, "chain:"+candidate.Chain)
-		}
+		// Acknowledge the barrier only after verified fork choice or canonical convergence.
+		candidate.ReorgEpoch = current.ReorgEpoch
+		candidate.ReorgPending = false
 	}
 	redisCtx, finishRedis = c.telemetry.Span(ctx, "redis.publish_head", "chain:"+candidate.Chain, "operation:publish_head")
 	published, err := c.store.Publish(redisCtx, token, candidate)
@@ -343,15 +410,40 @@ func (c *Coordinator) consider(ctx context.Context, token string, candidate head
 		c.telemetry.Count("redis.failure", 1, "chain:"+candidate.Chain, "operation:publish_head")
 		return err
 	}
+	if published.Family == "evm" {
+		c.telemetry.Gauge("head.reorg_pending", 0, "chain:"+published.Chain)
+		if current.ReorgPending {
+			c.logger.Info("EVM reorg recovery completed", "chain", published.Chain, "reorg_epoch", published.ReorgEpoch)
+		}
+	}
 	c.telemetry.Gauge("head.number", float64(published.Number), "chain:"+published.Chain, "commitment:"+published.Commitment, "family:"+published.Family)
 	c.telemetry.Gauge("head.age", time.Since(published.ObservedAt).Seconds(), "chain:"+published.Chain, "commitment:"+published.Commitment)
 	c.telemetry.Gauge("head.stuck_age", time.Since(published.ChangedAt).Seconds(), "chain:"+published.Chain, "commitment:"+published.Commitment)
 	return nil
 }
 
-func (c *Coordinator) validateEVMTransition(ctx context.Context, current, candidate head.Head) (bool, error) {
-	if candidate.Number == current.Number+1 && strings.EqualFold(candidate.ParentHash, current.Hash) {
+func (c *Coordinator) validateEVMTransition(ctx context.Context, request evmTransitionRequest) (bool, error) {
+	current, candidate := request.current, request.candidate
+	reported := false
+	reportDivergence := func() error {
+		if reported || request.onDivergence == nil {
+			return nil
+		}
+		reported = true
+		return request.onDivergence()
+	}
+	if candidate.Number > current.Number && candidate.Number-current.Number == 1 && strings.EqualFold(candidate.ParentHash, current.Hash) {
 		return false, nil
+	}
+	// The accepted header already proves this immediate ancestor. Lagging fallback
+	// observations should not cause an ancestry walk or a false reorg fence.
+	if current.Number > candidate.Number && current.Number-candidate.Number == 1 && strings.EqualFold(current.ParentHash, candidate.Hash) {
+		return false, nil
+	}
+	if (candidate.Number == current.Number || candidate.Number > current.Number && candidate.Number-current.Number == 1) && !strings.EqualFold(candidate.Hash, current.Hash) {
+		if err := reportDivergence(); err != nil {
+			return false, err
+		}
 	}
 	depth := c.runtime.Config.ReorgDepth
 	if depth < 1 {
@@ -385,6 +477,11 @@ func (c *Coordinator) validateEVMTransition(ctx context.Context, current, candid
 	if candidateCursor.Number == current.Number && strings.EqualFold(candidateCursor.Hash, current.Hash) {
 		return false, nil
 	}
+	if candidateCursor.Number == current.Number {
+		if err := reportDivergence(); err != nil {
+			return false, err
+		}
+	}
 
 	currentAncestors := map[string]uint64{current.Hash: current.Number}
 	cursor := current
@@ -398,7 +495,13 @@ func (c *Coordinator) validateEVMTransition(ctx context.Context, current, candid
 			return false, errors.New("current chain has invalid parent linkage")
 		}
 		currentAncestors[parent.Hash] = parent.Number
+		if parent.Number == candidate.Number && strings.EqualFold(parent.Hash, candidate.Hash) {
+			return false, nil
+		}
 		cursor = parent
+	}
+	if err := reportDivergence(); err != nil {
+		return false, err
 	}
 
 	cursor = candidateCursor
@@ -435,6 +538,13 @@ func (c *Coordinator) emitHeadAges(ctx context.Context) {
 		if c.runtime.Config.Family == "evm" && commitment != head.Latest {
 			continue
 		}
+		if acceptedHead.Family == "evm" {
+			pending := float64(0)
+			if acceptedHead.ReorgPending {
+				pending = 1
+			}
+			c.telemetry.Gauge("head.reorg_pending", pending, "chain:"+acceptedHead.Chain)
+		}
 		if !acceptedHead.ObservedAt.IsZero() {
 			c.telemetry.Gauge("head.age", time.Since(acceptedHead.ObservedAt).Seconds(), "chain:"+acceptedHead.Chain, "family:"+acceptedHead.Family, "commitment:"+commitment)
 		}
@@ -463,9 +573,10 @@ func (c *Coordinator) recordProviderHead(observedHead head.Head) {
 	c.providerMu.Unlock()
 }
 
-func (c *Coordinator) currentStillObserved(ctx context.Context, current head.Head) (bool, error) {
+func (c *Coordinator) getCanonicalEvidence(ctx context.Context, current head.Head) (canonicalEvidence, error) {
 	uncertain := false
 	checked := 0
+	matching := 0
 	for _, candidate := range c.runtime.Candidates(false) {
 		queryCtx, cancel := context.WithTimeout(ctx, time.Second)
 		blockCall, err := c.call(queryCtx, candidate, "eth_getBlockByNumber", utils.FormatEVMQuantity(current.Number), false)
@@ -481,13 +592,16 @@ func (c *Coordinator) currentStillObserved(ctx context.Context, current head.Hea
 		}
 		checked++
 		if strings.EqualFold(observedHead.Hash, current.Hash) {
-			return true, nil
+			matching++
 		}
 	}
-	if uncertain || checked == 0 {
-		return false, errors.New("cannot prove accepted head was displaced")
+	if matching > 0 {
+		return canonicalEvidence{observed: true, allCurrent: !uncertain && matching == checked}, nil
 	}
-	return false, nil
+	if uncertain || checked == 0 {
+		return canonicalEvidence{}, errors.New("cannot prove accepted head was displaced")
+	}
+	return canonicalEvidence{}, nil
 }
 
 func (c *Coordinator) watchEVM(ctx context.Context, candidate *upstream.Client, output chan<- observation) {

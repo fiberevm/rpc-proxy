@@ -22,16 +22,18 @@ import (
 )
 
 type fakeEVM struct {
-	t             *testing.T
-	number        uint64
-	hash          string
-	parent        string
-	stateCalls    int
-	lastStateArgs []json.RawMessage
-	failState     bool
-	receipt       receiptReply
-	mu            sync.Mutex
-	server        *httptest.Server
+	t              *testing.T
+	number         uint64
+	hash           string
+	parent         string
+	stateCalls     int
+	lastStateArgs  []json.RawMessage
+	failState      bool
+	stateReplyHook func()
+	stateError     *jsonrpc.Error
+	receipt        receiptReply
+	mu             sync.Mutex
+	server         *httptest.Server
 }
 
 func newFakeEVM(t *testing.T, number uint64, hashValue, parent string) *fakeEVM {
@@ -109,6 +111,8 @@ func (f *fakeEVM) serveHTTP(w http.ResponseWriter, request *http.Request) {
 		f.mu.Lock()
 		f.stateCalls++
 		f.lastStateArgs = append([]json.RawMessage(nil), call.Params...)
+		stateReplyHook := f.stateReplyHook
+		stateError := f.stateError
 		f.mu.Unlock()
 		if failState {
 			writeFake(f.t, w, call.ID, nil, &jsonrpc.Error{Code: -32001, Message: "block not found"})
@@ -123,6 +127,13 @@ func (f *fakeEVM) serveHTTP(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 		result = "0x64"
+		if stateReplyHook != nil {
+			stateReplyHook()
+		}
+		if stateError != nil {
+			writeFake(f.t, w, call.ID, nil, stateError)
+			return
+		}
 	default:
 		writeFake(f.t, w, call.ID, nil, &jsonrpc.Error{Code: -32601, Message: "method not found"})
 		return

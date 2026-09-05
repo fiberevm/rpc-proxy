@@ -18,6 +18,7 @@ type RedisStore struct {
 	renewScript   *redis.Script
 	releaseScript *redis.Script
 	publishScript *redis.Script
+	reorgScript   *redis.Script
 }
 
 // RedisStoreOptions contains the validated connection and retention settings for shared head storage.
@@ -50,6 +51,11 @@ const publishScriptSource = `
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {-1, ''} end
 local incoming = cjson.decode(ARGV[2])
 local currentRaw = redis.call('HGET', KEYS[2], incoming['commitment'])
+if incoming['family'] == 'evm' and incoming['commitment'] == 'latest' then
+  local epoch = 0
+  if currentRaw then epoch = cjson.decode(currentRaw)['reorg_epoch'] or 0 end
+  if incoming['reorg_pending'] or (incoming['reorg_epoch'] or 0) ~= epoch then return {-2, ''} end
+end
 if currentRaw then
   local current = cjson.decode(currentRaw)
   local same = false
@@ -73,6 +79,21 @@ end
 return {generation, encoded}
 `
 
+const beginReorgScriptSource = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {-1, ''} end
+local raw = redis.call('HGET', KEYS[2], 'latest')
+if not raw then return {-2, ''} end
+local current = cjson.decode(raw)
+if current['family'] ~= 'evm' then return {-2, ''} end
+if not current['reorg_pending'] then
+  current['reorg_epoch'] = (current['reorg_epoch'] or 0) + 1
+  current['reorg_pending'] = true
+  raw = cjson.encode(current)
+  redis.call('HSET', KEYS[2], 'latest', raw)
+end
+return {1, raw}
+`
+
 // NewRedisStore creates the Redis-backed fenced head store used across proxy replicas.
 func NewRedisStore(options RedisStoreOptions) (*RedisStore, error) {
 	redisOptions, err := redis.ParseURL(options.URL)
@@ -87,6 +108,7 @@ func NewRedisStore(options RedisStoreOptions) (*RedisStore, error) {
 		renewScript:   redis.NewScript(renewScriptSource),
 		releaseScript: redis.NewScript(releaseScriptSource),
 		publishScript: redis.NewScript(publishScriptSource),
+		reorgScript:   redis.NewScript(beginReorgScriptSource),
 	}, nil
 }
 
@@ -142,7 +164,7 @@ func (r *RedisStore) Release(ctx context.Context, chain, token string) error {
 	return nil
 }
 
-// Publish stores one accepted head only while token remains the current fencing token.
+// Publish stores acceptedHead only while token owns its chain and its epoch acknowledges the reorg fence.
 func (r *RedisStore) Publish(ctx context.Context, token string, acceptedHead Head) (Head, error) {
 	if acceptedHead.ChangedAt.IsZero() {
 		acceptedHead.ChangedAt = acceptedHead.ObservedAt
@@ -163,8 +185,11 @@ func (r *RedisStore) Publish(ctx context.Context, token string, acceptedHead Hea
 	if !ok {
 		return Head{}, fmt.Errorf("publish accepted head for %s: invalid generation", acceptedHead.Chain)
 	}
-	if generation < 0 {
+	if generation == -1 {
 		return Head{}, ErrLeadershipLost
+	}
+	if generation == -2 {
+		return Head{}, ErrReorgFence
 	}
 	refreshed, ok := response[1].(string)
 	if !ok {
@@ -174,6 +199,37 @@ func (r *RedisStore) Publish(ctx context.Context, token string, acceptedHead Hea
 		return Head{}, fmt.Errorf("decode published head for %s: %w", acceptedHead.Chain, err)
 	}
 	return acceptedHead, nil
+}
+
+// BeginReorg blocks readers of chain and advances its epoch only when token owns the leader lease.
+func (r *RedisStore) BeginReorg(ctx context.Context, chain, token string) (Head, error) {
+	keys := []string{r.key(chain, "leader"), r.key(chain, "heads")}
+	response, err := r.reorgScript.Run(ctx, r.client, keys, token).Slice()
+	if err != nil {
+		return Head{}, fmt.Errorf("begin redis reorg for %s: %w", chain, err)
+	}
+	if len(response) != 2 {
+		return Head{}, errors.New("invalid redis reorg response")
+	}
+	status, ok := response[0].(int64)
+	if !ok {
+		return Head{}, errors.New("invalid redis reorg status")
+	}
+	if status == -1 {
+		return Head{}, ErrLeadershipLost
+	}
+	if status == -2 {
+		return Head{}, ErrReorgFence
+	}
+	encodedHead, ok := response[1].(string)
+	if !ok || status != 1 {
+		return Head{}, errors.New("invalid redis reorg head")
+	}
+	var current Head
+	if err := json.Unmarshal([]byte(encodedHead), &current); err != nil {
+		return Head{}, fmt.Errorf("decode redis reorg head: %w", err)
+	}
+	return current, nil
 }
 
 // Snapshot reads all accepted commitment heads for chain in one Redis operation.

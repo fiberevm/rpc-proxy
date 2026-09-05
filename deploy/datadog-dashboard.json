@@ -23,6 +23,13 @@
       {"q": "sum:rpc_proxy.consistency.failure{env:$env,chain:$chain} by {failure_class}.as_count()", "display_type": "bars"},
       {"q": "sum:rpc_proxy.head.reorg{env:$env,chain:$chain}.as_count()", "display_type": "bars"}
     ]}},
+    {"definition": {"type": "timeseries", "title": "Reorg read fencing", "requests": [
+      {"q": "sum:rpc_proxy.head.reorg_detected{env:$env,chain:$chain}.as_count()", "display_type": "bars"},
+      {"q": "sum:rpc_proxy.reorg.read_rejected{env:$env,chain:$chain} by {failure_class}.as_count()", "display_type": "bars"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "Reorg recovery pending", "requests": [
+      {"q": "max:rpc_proxy.head.reorg_pending{env:$env,chain:$chain}", "display_type": "line"}
+    ]}},
     {"definition": {"type": "timeseries", "title": "Upstream latency", "requests": [
       {"q": "p95:rpc_proxy.upstream.request.duration{env:$env,chain:$chain} by {upstream}", "display_type": "line"}
     ]}},

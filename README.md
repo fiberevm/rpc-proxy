@@ -9,6 +9,7 @@ RPC providers do not always agree on the latest block. When one provider sees a 
 - **Exact-state reads:** supported EVM balance, storage, code, transaction-count, contract-call, and proof reads are pinned by block hash, not a provider's interpretation of `latest`.
 - **Failover without stale fallback:** try another provider or wait for catch-up; if the target remains unavailable, return a consistency error instead of older state.
 - **Consistency across replicas and batches:** fenced Redis coordination shares the accepted head across replicas; every batch captures one snapshot.
+- **Reorg-safe read fencing:** a shared reorg marker blocks pinned reads during recovery, and a final batch-wide check discards results that crossed a detected reorg.
 - **Subscription-first, latest-only EVM heads:** `newHeads` drives updates, with HTTP polling only as fallback. No `safe`/`finalized` polling or periodic capability revalidation.
 - **Solana slot floors:** supported reads receive an accepted `minContextSlot`, not an exact historical-state promise.
 - **Observability:** Datadog traces, DogStatsD metrics, structured redacted logs, and private health/status endpoints.
@@ -27,6 +28,7 @@ For example, once the proxy accepts block **N** with hash **H**, a `latest` bala
 - A Redis-backed coordinator supplies one accepted snapshot to every proxy replica.
 - A request never falls back to a block or slot older than its selected snapshot.
 - A JSON-RPC batch uses one snapshot. Separate requests may advance to newer snapshots.
+- Before returning EVM head-targeted results, the proxy checks that no reorg was recorded since the batch snapshot. Ordinary head advancement does not invalidate the snapshot.
 - "Latest" is the freshest valid head observed from configured trusted upstreams. It is not a Byzantine or network-global guarantee.
 
 The service rejects writes, EVM pending-state reads, and unknown methods rather than serving them without the stated guarantee.
@@ -38,7 +40,8 @@ The exact-block guarantee applies to supported pinned EVM state reads against tr
 1. Startup validates provider identity/capabilities once. The chain coordinator observes all configured providers, verifies EVM linkage, and publishes EVM `latest` (or Solana commitment slots) through a fenced Redis leader.
 2. The HTTP handler reads one Redis snapshot for the whole request or batch and transforms every supported state-dependent method against it.
 3. Routing probes provider availability for that exact hash or slot floor, prefers the observing provider, retries other eligible providers once, waits for catch-up when necessary, and fails closed at the request deadline.
-4. EVM `newHeads` subscribers consume the accepted Redis Stream. Missing headers are backfilled by hash, duplicate hashes are suppressed, and unrecoverable gaps close the connection.
+4. After every batch item finishes, one final Redis snapshot fences EVM head-targeted results against a reorg, unresolved recovery, stale head, or Redis failure. Invalidated results become retryable consistency errors; the proxy does not silently re-pin them.
+5. EVM `newHeads` subscribers consume the accepted Redis Stream. Missing headers are backfilled by hash, duplicate hashes are suppressed, and unrecoverable gaps close the connection.
 
 The strict registries live in [internal/gateway/transform.go](internal/gateway/transform.go). Adding a method requires defining its exact consistency transformation and tests; there is intentionally no vendor-method passthrough switch.
 
@@ -53,6 +56,22 @@ The effective Solana floor is the maximum of the accepted slot and the caller's 
 Diagnostic head headers describe successful requests' actual targets, including historical EVM blocks and caller-supplied Solana slot floors. A batch with different targets receives `X-RPC-Consistency: mixed-targets` and no misleading single head number/hash. Static methods have no head headers; explicit hash reads omit a number when it is unknown.
 
 JSON-RPC server errors use `-32070` for consistency unavailable, `-32071` for unsupported consistency semantics, `-32072` for writes/signing disabled, and `-32073` for an unknown chain. Valid JSON-RPC calls return HTTP 200; notification-only requests return no JSON-RPC body.
+
+## Reorg protection
+
+When the coordinator detects divergent EVM ancestry, it atomically increments a shared Redis `reorg_epoch` and sets `reorg_pending` **before continuing fork recovery**. New head-targeted reads fail closed while this marker is set. An expired leader cannot set or clear it, and a replacement coordinator inherits it.
+
+The coordinator verifies parent hashes and a common ancestor within `reorg_depth`. A longer valid fork may replace the accepted head. Equal-height disagreement keeps the old head but leaves reads fenced while providers disagree; recovery can also finish when healthy eligible providers agree that the existing hash is canonical. Missing ancestry or uncertain recovery leaves the marker set. Merely observing a lagging ancestor is not a reorg.
+
+Before sending an HTTP response, the gateway re-reads Redis once for the entire request or batch. If the reorg epoch changed, recovery remains pending, the head is stale, or the check fails, it discards every head-targeted result—including local `eth_blockNumber` results and state-dependent upstream errors—and returns `-32070` with `data.retryable: true`. The counter detects **A → B → A** even when the final hash matches the starting hash. No invalidated value or its head diagnostics is returned. Static reads, receipt lookups, and notification behavior retain their separate semantics.
+
+Clients should retry after recovery; retry the whole batch when all results must share one successful snapshot. Subsequent `latest` reads pin to the recovered hash. This adds one Redis round trip per head-targeted HTTP envelope, not additional per-request provider polling. Normal new blocks leave the reorg epoch unchanged.
+
+The guarantee is **a consistent result or an error, not guaranteed availability or finality**. Its checkpoint is the final Redis read: a reorg recorded between the request snapshot and that check invalidates the response. No proxy can revoke responses already checked or delivered, detect a fork no trusted provider has reported, or prevent a reorg after the check while bytes are in transit. Coordination assumes all replicas use the same authoritative Redis state; stale Redis replicas or rollback of acknowledged coordination writes are outside this guarantee. Receipt lookup still has no canonical-state guarantee, and Solana retains its slot-floor contract.
+
+`/health/ready` returns 503 during pending recovery; `/status` exposes `reorg_epoch` and `reorg_pending`. Active WebSocket sessions close with a retryable error if their head-stream check observes unresolved recovery; reconnect with backoff. A reorg that completes between checks continues through the normal accepted-head stream and backfill path.
+
+Upgrade **all proxy replicas and coordinators** before relying on this fence. Older versions do not understand the marker and must not serve traffic or publish heads in the same deployment. Do not delete the Redis head keys to bypass a recovery failure.
 
 ## Run locally
 
@@ -105,7 +124,7 @@ curl http://127.0.0.1:8080/rpc/ethereum \
 - Production chains should configure at least two upstreams.
 - EVM head tracking is subscription-first: configure `websocket_url` on every upstream to subscribe to `newHeads`. Only the elected coordinator opens these upstream subscriptions. A confirmed subscription bootstraps its current head once over HTTP; subsequent notifications are verified by hash before acceptance. Hash verification, ancestry backfill, request-time availability checks, and normal client reads still use HTTP.
 - `poll_interval` (default `2s`) is the per-upstream EVM `latest` fallback interval, not an additional poll alongside healthy subscriptions. Providers without WebSockets, with rejected/disconnected subscriptions, or without a new verified head within `websocket_idle_timeout` (default 75% of `max_head_age`) are polled. Disconnected streams reconnect with backoff; duplicate headers and unrelated frames do not extend the idle deadline. Configure the idle timeout above normal block spacing and below `max_head_age`, leaving room for the fallback interval and request latency.
-- EVM never polls `safe` or `finalized`. Readiness requires only a fresh `latest` head and an eligible provider. Legacy safe/finalized Redis entries are ignored by EVM reads, readiness, status, and head-age metrics; no Redis flush is needed. Solana continues to poll all three commitments at `poll_interval`.
+- EVM never polls `safe` or `finalized`. Readiness requires a fresh `latest` head, no pending reorg, and an eligible provider. Legacy safe/finalized Redis entries are ignored by EVM reads, readiness, status, and head-age metrics; no Redis flush is needed. Solana continues to poll all three commitments at `poll_interval`.
 - `head_request_timeout` (default `2s`) bounds each coordinator head query and WebSocket setup independently of poll frequency. Startup identity/capability validation runs once per replica, with no periodic revalidation.
 - When upgrading an older configuration, remove `commitment_poll_interval` and `validation_interval`; these settings no longer exist and strict YAML validation rejects them. Restart the proxy to apply the new configuration.
 - EVM upstreams that fail the per-method EIP-1898 probes remain unavailable for those state reads.
@@ -117,6 +136,7 @@ curl http://127.0.0.1:8080/rpc/ethereum \
 - YAML field names are checked strictly; unknown fields and multiple documents fail startup.
 - Availability checks are coalesced and independently cancelable. Negative checks expire after 75 ms, and each chain's cache is bounded to 4,096 entries.
 - Redis publishes every accepted fork transition, including a return to an earlier hash. Duplicate suppression belongs to each live WebSocket connection, not the shared stream.
+- `head.reorg_detected` counts new reorg fences, `head.reorg_pending` reports unresolved recovery, and `reorg.read_rejected` counts invalidated in-flight items. `consistency.failure` distinguishes `reorg_pending`, `reorg_changed`, and `reorg_check_unavailable`; no hashes or epoch values are metric tags.
 - Subscriptions capture an atomic cursor/header checkpoint before acknowledgment. Trimmed checkpoints and unverifiable backfill close the connection; clients should reconnect with backoff. Each connection is limited to 128 subscriptions and 65,536 distinct delivered hashes, after which it must reconnect to preserve bounded memory and connection-scoped deduplication.
 - Leadership renewal runs independently of slow ancestry validation. An unreachable provider is not treated as evidence authorizing a rollback. Solana floors never decrease because another provider is lagging.
 - Upstream redirects are rejected so credential-bearing custom headers cannot be forwarded to another endpoint. Logs redact full endpoint URLs, including API keys embedded in paths; status exposes a local `metric_submission_errors` counter.

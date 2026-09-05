@@ -9,6 +9,33 @@ import (
 	"time"
 )
 
+func TestRedisReorgFenceAcrossClients(t *testing.T) {
+	rawURL := os.Getenv("RPC_PROXY_TEST_REDIS_URL")
+	if rawURL == "" {
+		t.Skip("RPC_PROXY_TEST_REDIS_URL is not set")
+	}
+	options := RedisStoreOptions{URL: rawURL, KeyPrefix: fmt.Sprintf("rpc-proxy-reorg-test-%d", time.Now().UnixNano()), StreamMaxLength: 32}
+	writer, err := NewRedisStore(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := writer.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	reader, err := NewRedisStore(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := reader.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	testReorgFence(t, writer, reader)
+}
+
 func TestRedisStoreFencingGenerationAndStream(t *testing.T) {
 	rawURL := os.Getenv("RPC_PROXY_TEST_REDIS_URL")
 	if rawURL == "" {
@@ -39,6 +66,9 @@ func TestRedisStoreFencingGenerationAndStream(t *testing.T) {
 	}
 	if _, err := store.Publish(ctx, firstToken, Head{Chain: "ethereum", Family: "evm", Commitment: Latest, Number: 11, Hash: hash(11)}); !errors.Is(err, ErrLeadershipLost) {
 		t.Fatalf("expired leader was not fenced: %v", err)
+	}
+	if _, err := store.BeginReorg(ctx, "ethereum", firstToken); !errors.Is(err, ErrLeadershipLost) {
+		t.Fatalf("expired leader changed reorg state: %v", err)
 	}
 	second, err := store.Publish(ctx, secondToken, Head{Chain: "ethereum", Family: "evm", Commitment: Latest, Number: 11, Hash: hash(11), ParentHash: first.Hash, ObservedAt: time.Now()})
 	if err != nil {

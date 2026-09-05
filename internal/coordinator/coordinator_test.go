@@ -38,7 +38,7 @@ func TestValidateEVMTransitionAcceptsContinuousJump(t *testing.T) {
 	b11 := coordinatorBlock(11, 'b', 'a')
 	b12 := coordinatorBlock(12, 'c', 'b')
 	coordinator := testCoordinator(t, 4, []head.Head{b10, b11, b12}, map[uint64]head.Head{10: b10, 11: b11, 12: b12}, b12)
-	reorg, err := coordinator.validateEVMTransition(context.Background(), b10, b12)
+	reorg, err := coordinator.validateEVMTransition(context.Background(), evmTransitionRequest{current: b10, candidate: b12})
 	if err != nil || reorg {
 		t.Fatalf("continuous jump rejected: reorg=%v err=%v", reorg, err)
 	}
@@ -51,7 +51,7 @@ func TestValidateEVMTransitionAcceptsBoundedReorg(t *testing.T) {
 	fork11 := coordinatorBlock(11, 'e', 'd')
 	fork12 := coordinatorBlock(12, 'f', 'e')
 	coordinator := testCoordinator(t, 4, []head.Head{common, current, fork10, fork11, fork12}, map[uint64]head.Head{9: common, 10: fork10, 11: fork11, 12: fork12}, fork12)
-	reorg, err := coordinator.validateEVMTransition(context.Background(), current, fork12)
+	reorg, err := coordinator.validateEVMTransition(context.Background(), evmTransitionRequest{current: current, candidate: fork12})
 	if err != nil || !reorg {
 		t.Fatalf("bounded reorg rejected: reorg=%v err=%v", reorg, err)
 	}
@@ -65,7 +65,7 @@ func TestValidateEVMTransitionRejectsDisconnectedFork(t *testing.T) {
 	fork11 := coordinatorBlock(11, 'e', 'd')
 	fork12 := coordinatorBlock(12, 'f', 'e')
 	coordinator := testCoordinator(t, 1, []head.Head{currentParent, current, forkParent, fork10, fork11, fork12}, map[uint64]head.Head{9: forkParent, 10: fork10, 11: fork11, 12: fork12}, fork12)
-	if _, err := coordinator.validateEVMTransition(context.Background(), current, fork12); err == nil {
+	if _, err := coordinator.validateEVMTransition(context.Background(), evmTransitionRequest{current: current, candidate: fork12}); err == nil {
 		t.Fatal("expected disconnected fork rejection")
 	}
 }
@@ -77,7 +77,7 @@ func TestTransitionDoesNotTrustUnlinkedNumberLookup(t *testing.T) {
 	fork12 := coordinatorBlock(12, 'f', 'e')
 	// A load balancer may answer numbered reads from the old fork and hash reads from a new fork.
 	coordinator := testCoordinator(t, 4, []head.Head{current, fork10, fork11, fork12}, map[uint64]head.Head{10: current}, fork12)
-	if _, err := coordinator.validateEVMTransition(context.Background(), current, fork12); err == nil {
+	if _, err := coordinator.validateEVMTransition(context.Background(), evmTransitionRequest{current: current, candidate: fork12}); err == nil {
 		t.Fatal("accepted disconnected chain using unrelated numbered response")
 	}
 }
@@ -99,8 +99,8 @@ func TestSolanaObservationCannotLowerAcceptedFloor(t *testing.T) {
 func TestMissingProviderEvidenceDoesNotAuthorizeRollback(t *testing.T) {
 	current := coordinatorBlock(10, 'a', '9')
 	coordinator := testCoordinator(t, 4, []head.Head{current}, nil, current)
-	if observed, err := coordinator.currentStillObserved(context.Background(), current); observed || err == nil {
-		t.Fatalf("missing response authorized rollback: observed=%v err=%v", observed, err)
+	if evidence, err := coordinator.getCanonicalEvidence(context.Background(), current); evidence.observed || err == nil {
+		t.Fatalf("missing response authorized rollback: observed=%v err=%v", evidence.observed, err)
 	}
 }
 

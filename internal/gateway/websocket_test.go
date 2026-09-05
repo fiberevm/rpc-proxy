@@ -120,6 +120,50 @@ func TestWebsocketRejectsInvalidParentHeights(t *testing.T) {
 	}
 }
 
+func TestWebsocketReorgPending(t *testing.T) {
+	for _, pendingAtSubscribe := range []bool{true, false} {
+		t.Run(fmt.Sprintf("pending_at_subscribe_%v", pendingAtSubscribe), func(t *testing.T) {
+			fixture := newReorgGatewayFixture(t)
+			if pendingAtSubscribe {
+				fixture.beginReorg()
+			}
+			server := httptest.NewServer(fixture.proxy.WebsocketHandler())
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/test", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.CloseNow()
+			if err := writeTestWS(ctx, conn, jsonrpc.Request{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "eth_subscribe", Params: json.RawMessage(`["newHeads"]`)}); err != nil {
+				t.Fatal(err)
+			}
+			_, payload, err := conn.Read(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var response jsonrpc.Response
+			if err := json.Unmarshal(payload, &response); err != nil {
+				t.Fatal(err)
+			}
+			if pendingAtSubscribe {
+				if response.Error == nil || response.Error.Code != jsonrpc.CodeConsistencyUnavailable {
+					t.Fatalf("subscription admitted during recovery: %s", payload)
+				}
+				return
+			}
+			if response.Error != nil {
+				t.Fatalf("initial subscription failed: %s", payload)
+			}
+			fixture.beginReorg()
+			if _, _, err := conn.Read(ctx); websocket.CloseStatus(err) != websocket.StatusTryAgainLater {
+				t.Fatalf("live pending recovery did not close retryably: %v", err)
+			}
+		})
+	}
+}
+
 func TestWebsocketBackfillsMissingHeaders(t *testing.T) {
 	last := wsHead(t, 10, testHash('0'), testHash('9'))
 	provider := newFakeEVM(t, 12, testHash('c'), testHash('b'))

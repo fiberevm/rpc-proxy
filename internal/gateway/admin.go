@@ -42,6 +42,10 @@ func (g *Gateway) ready(w http.ResponseWriter, request *http.Request) {
 		}
 		for _, commitment := range commitments {
 			acceptedHead, ok := snapshot.Get(commitment)
+			if acceptedHead.ReorgPending {
+				http.Error(w, "reorg recovery in progress", http.StatusServiceUnavailable)
+				return
+			}
 			if !ok || acceptedHead.IsZero() || (runtime.Config.MaxHeadAge.Value() > 0 && time.Since(acceptedHead.ObservedAt) > runtime.Config.MaxHeadAge.Value()) {
 				http.Error(w, "accepted head is stale", http.StatusServiceUnavailable)
 				return

@@ -125,7 +125,7 @@ func (s *wsSession) subscribe(request jsonrpc.Request) {
 		checkpoint, err = s.gateway.store.StreamStart(redisCtx, s.runtime.Config.Name)
 		finish(err)
 		var accepted head.Head
-		if err == nil && s.runtime.Config.MaxHeadAge.Value() > 0 {
+		if err == nil {
 			var snapshot head.Snapshot
 			snapshot, err = s.gateway.store.Snapshot(queryCtx, s.runtime.Config.Name)
 			accepted, _ = snapshot.Get(head.Latest)
@@ -136,8 +136,8 @@ func (s *wsSession) subscribe(request jsonrpc.Request) {
 			s.enqueueResponse(jsonrpc.Failure(request.ID, jsonrpc.ConsistencyUnavailable("head stream unavailable")))
 			return
 		}
-		if s.runtime.Config.MaxHeadAge.Value() > 0 && (accepted.IsZero() || time.Since(accepted.ObservedAt) > s.runtime.Config.MaxHeadAge.Value()) {
-			s.enqueueResponse(jsonrpc.Failure(request.ID, jsonrpc.ConsistencyUnavailable("accepted head is stale")))
+		if accepted.ReorgPending || s.runtime.Config.MaxHeadAge.Value() > 0 && (accepted.IsZero() || time.Since(accepted.ObservedAt) > s.runtime.Config.MaxHeadAge.Value()) {
+			s.enqueueResponse(jsonrpc.Failure(request.ID, jsonrpc.ConsistencyUnavailable("accepted head is stale or reorg pending")))
 			return
 		}
 	}
@@ -213,13 +213,11 @@ func (s *wsSession) eventLoop(checkpoint head.Event) {
 			s.closeWithError("head stream read failed")
 			return
 		}
-		if s.runtime.Config.MaxHeadAge.Value() > 0 {
-			snapshot, err := s.gateway.store.Snapshot(s.ctx, s.runtime.Config.Name)
-			accepted, ok := snapshot.Get(head.Latest)
-			if err != nil || !ok || time.Since(accepted.ObservedAt) > s.runtime.Config.MaxHeadAge.Value() {
-				s.closeWithError("accepted head is stale or unavailable")
-				return
-			}
+		snapshot, err := s.gateway.store.Snapshot(s.ctx, s.runtime.Config.Name)
+		accepted, ok := snapshot.Get(head.Latest)
+		if err != nil || accepted.ReorgPending || s.runtime.Config.MaxHeadAge.Value() > 0 && (!ok || time.Since(accepted.ObservedAt) > s.runtime.Config.MaxHeadAge.Value()) {
+			s.closeWithError("accepted head is stale, unavailable, or reorg pending")
+			return
 		}
 		for _, event := range events {
 			cursor = event.ID
@@ -382,7 +380,8 @@ func (s *wsSession) writeLoop() {
 }
 
 func (s *wsSession) closeWithError(reason string) {
-	if err := s.conn.Close(websocket.StatusInternalError, reason); err != nil {
+	// Recovery and retention failures require reconnecting with a fresh checkpoint.
+	if err := s.conn.Close(websocket.StatusTryAgainLater, reason); err != nil {
 		s.gateway.logger.Debug("close websocket with error", "chain", s.runtime.Config.Name, "error", err)
 	}
 	s.cancel()

@@ -132,6 +132,7 @@ func (g *Gateway) ServeRPC(w http.ResponseWriter, request *http.Request, chainNa
 		go func() { defer wg.Done(); responses[index] = g.process(ctx, runtime, snapshot, rpcRequest) }()
 	}
 	wg.Wait()
+	g.fenceEVMResponses(ctx, evmResponseFence{runtime: runtime, snapshot: snapshot, responses: responses})
 	filtered := make([]jsonrpc.Response, 0, len(responses))
 	selectedUpstream := ""
 	for i, response := range responses {
@@ -193,6 +194,13 @@ func (g *Gateway) process(ctx context.Context, runtime *chain.Runtime, snapshot 
 		g.logger.WarnContext(ctx, "rpc request rejected", attributes...)
 		return processedResponse{response: jsonrpc.Failure(request.ID, rpcErr)}
 	}
+	if runtime.Config.Family == "evm" && prepared.target != nil {
+		accepted, exists := snapshot.Get(head.Latest)
+		if !exists || accepted.IsZero() || accepted.ReorgPending {
+			g.telemetry.Count("consistency.failure", 1, "chain:"+runtime.Config.Name, "failure_class:reorg_pending")
+			return processedResponse{response: jsonrpc.Failure(request.ID, jsonrpc.ConsistencyUnavailable(map[string]any{"chain": runtime.Config.Name, "reason": "accepted head unavailable or reorg pending", "retryable": true}))}
+		}
+	}
 	if prepared.target != nil && prepared.target.Commitment != "explicit" && runtime.Config.MaxHeadAge.Value() > 0 && (prepared.target.ObservedAt.IsZero() || time.Since(prepared.target.ObservedAt) > runtime.Config.MaxHeadAge.Value()) {
 		g.telemetry.Count("consistency.failure", 1, "chain:"+runtime.Config.Name, "failure_class:stale_head")
 		g.telemetry.Count("request.error", 1, "chain:"+runtime.Config.Name, "method:"+g.metricMethod(request.Method, runtime.Config.Family), "failure_class:stale_head")
@@ -213,7 +221,7 @@ func (g *Gateway) process(ctx context.Context, runtime *chain.Runtime, snapshot 
 		attributes := []any{"chain", runtime.Config.Name, "method", request.Method, "rpc_error_code", upstreamErr.Code}
 		attributes = append(attributes, g.telemetry.TraceAttrs(ctx)...)
 		g.logger.WarnContext(ctx, "rpc request failed", attributes...)
-		return processedResponse{response: jsonrpc.Failure(request.ID, upstreamErr), upstream: upstreamID}
+		return processedResponse{response: jsonrpc.Failure(request.ID, upstreamErr), upstream: upstreamID, target: prepared.target}
 	}
 	return processedResponse{response: jsonrpc.Success(request.ID, upstreamResponse), upstream: upstreamID, target: prepared.target, receiptLookup: prepared.receiptHash != ""}
 }
@@ -419,7 +427,7 @@ func (g *Gateway) setResponseHeadHeaders(headers http.Header, family string, res
 	hasReceiptLookup := false
 	for _, response := range responses {
 		hasReceiptLookup = hasReceiptLookup || response.receiptLookup
-		if response.target == nil {
+		if response.target == nil || response.response.Error != nil {
 			continue
 		}
 		if acceptedHead != nil && (acceptedHead.Identity() != response.target.Identity() || acceptedHead.Commitment != response.target.Commitment) {
