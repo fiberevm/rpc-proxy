@@ -1,13 +1,15 @@
 # Fiber RPC Proxy
 
-A read-only, multichain JSON-RPC proxy that keeps supported EVM state reads pinned to one accepted block hash across providers and replicas.
+**Guaranteed read consistency across RPC providers.**
 
-RPC providers do not always agree on the latest block. When one provider sees a transaction's block before another, switching providers can make a balance or contract read appear to go backwards. Fiber RPC Proxy tracks the freshest verified head observed from your configured providers, pins reads to that hash, and waits or fails over when a provider cannot serve it. It fails closed instead of silently serving older state.
+For supported EVM state reads, Fiber RPC Proxy returns data from the exact block hash selected for the request—or a consistency error. A lagging provider cannot silently answer from an older block.
 
-- **Subscription-first EVM heads:** `newHeads` drives `latest`; HTTP polling is a fallback, not a parallel polling loop.
-- **Latest only:** no EVM `safe`/`finalized` polling and no periodic capability revalidation.
-- **Multiple providers and replicas:** fenced Redis coordination provides a shared accepted head and bounded head-event stream.
-- **Read-only RPC:** hash-pinned state reads, transaction-receipt lookup, JSON-RPC batches, and EVM `newHeads` subscriptions.
+RPC providers do not always agree on the latest block. When one provider sees a transaction's block before another, switching providers can make a balance or contract read appear to go backwards. Fiber RPC Proxy is a read-only, multichain JSON-RPC gateway that tracks the freshest verified head observed from your configured providers and pins supported EVM state reads to that hash. Switching providers does not change the state selected for the request.
+
+- **Exact-state reads:** supported EVM balance, storage, code, transaction-count, contract-call, and proof reads are pinned by block hash, not a provider's interpretation of `latest`.
+- **Failover without stale fallback:** try another provider or wait for catch-up; if the target remains unavailable, return a consistency error instead of older state.
+- **Consistency across replicas and batches:** fenced Redis coordination shares the accepted head across replicas; every batch captures one snapshot.
+- **Subscription-first, latest-only EVM heads:** `newHeads` drives updates, with HTTP polling only as fallback. No `safe`/`finalized` polling or periodic capability revalidation.
 - **Solana slot floors:** supported reads receive an accepted `minContextSlot`, not an exact historical-state promise.
 - **Observability:** Datadog traces, DogStatsD metrics, structured redacted logs, and private health/status endpoints.
 
@@ -16,6 +18,8 @@ RPC providers do not always agree on the latest block. When one provider sees a 
 This is an initial implementation. The [remaining production acceptance work](#remaining-production-acceptance-work) includes real-provider failover drills and the 1,000 RPS load target; those are not claimed as verified production results.
 
 ## Consistency contract
+
+For example, once the proxy accepts block **N** with hash **H**, a `latest` balance or contract read using that snapshot is pinned to **H**. A provider still at **N−1** is not allowed to answer from its older state. The proxy finds a provider that can serve **H**, waits within the request deadline, or returns an error.
 
 - EVM state reads are rewritten to an exact EIP-1898 block hash with `requireCanonical: true`.
 - EVM tracks `latest` only. The `safe` and `finalized` tags are rejected with unsupported-consistency errors; explicit historical numbers/hashes remain supported.
@@ -26,6 +30,8 @@ This is an initial implementation. The [remaining production acceptance work](#r
 - "Latest" is the freshest valid head observed from configured trusted upstreams. It is not a Byzantine or network-global guarantee.
 
 The service rejects writes, EVM pending-state reads, and unknown methods rather than serving them without the stated guarantee.
+
+The exact-block guarantee applies to supported pinned EVM state reads against trusted upstreams, not every RPC response. Transaction-receipt lookup has no block selector and does not promise snapshot consistency or finality. Solana guarantees a slot floor rather than an exact state snapshot. Chain reorgs can replace an accepted head; consistency does not mean balances can never decrease or that a block is final.
 
 ## Request path
 
