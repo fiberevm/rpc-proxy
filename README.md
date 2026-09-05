@@ -68,23 +68,15 @@ cp config.example.yaml rpc-proxy.yaml
 
 Edit `rpc-proxy.yaml` for the chains you need. The example includes Ethereum and Solana; remove the Solana entry for an EVM-only deployment. Set `datadog.enabled: false` when running without a Datadog Agent.
 
-Start Redis/Valkey, then export your endpoints and run the proxy. Replace the provider placeholders with your actual HTTP and WebSocket URLs:
+Set `redis.url` directly in the config (the example uses `redis://127.0.0.1:6379/0`). Replace each upstream's `http_url` and, for EVM, `websocket_url` with your actual provider endpoints. The `*.example.invalid` URLs are placeholders. If a provider requires authentication headers, put their values directly under that upstream's `headers` mapping.
+
+All example settings are supplied through the config file; no environment-variable setup is required. Start Redis/Valkey, then run:
 
 ```sh
-export REDIS_URL='redis://127.0.0.1:6379/0'
-export ETHEREUM_PROVIDER_A_HTTP_URL='https://YOUR_PROVIDER_A_HTTP_ENDPOINT'
-export ETHEREUM_PROVIDER_A_WS_URL='wss://YOUR_PROVIDER_A_WS_ENDPOINT'
-export ETHEREUM_PROVIDER_B_HTTP_URL='https://YOUR_PROVIDER_B_HTTP_ENDPOINT'
-export ETHEREUM_PROVIDER_B_WS_URL='wss://YOUR_PROVIDER_B_WS_ENDPOINT'
-
-# Required only if you kept Solana in rpc-proxy.yaml.
-export SOLANA_PROVIDER_A_HTTP_URL='https://YOUR_SOLANA_PROVIDER_A_ENDPOINT'
-export SOLANA_PROVIDER_B_HTTP_URL='https://YOUR_SOLANA_PROVIDER_B_ENDPOINT'
-
 make run
 ```
 
-Keep credentials in environment variables, not committed YAML. There is no hot reload; restart the process after configuration changes. Providers that fail startup validation require a restart before they can be retried.
+Keep real credentials only in your local `rpc-proxy.yaml`, which is excluded from Git and Docker build contexts. Do not put them in the committed example file, and restrict access to credential-bearing configs. There is no hot reload; restart the process after configuration changes. Providers that fail startup validation require a restart before they can be retried.
 
 HTTP JSON-RPC is available at `POST /rpc/{chain}`. EVM `newHeads` is available at `GET /ws/{chain}`. Health and redacted status endpoints listen on the separately configured admin address.
 
@@ -111,7 +103,7 @@ curl http://127.0.0.1:8080/rpc/ethereum \
 ## Operational notes
 
 - Production chains should configure at least two upstreams.
-- EVM head tracking is subscription-first: configure `websocket_url_env` (or `websocket_url`) on every upstream to subscribe to `newHeads`. Only the elected coordinator opens these upstream subscriptions. A confirmed subscription bootstraps its current head once over HTTP; subsequent notifications are verified by hash before acceptance. Hash verification, ancestry backfill, request-time availability checks, and normal client reads still use HTTP.
+- EVM head tracking is subscription-first: configure `websocket_url` on every upstream to subscribe to `newHeads`. Only the elected coordinator opens these upstream subscriptions. A confirmed subscription bootstraps its current head once over HTTP; subsequent notifications are verified by hash before acceptance. Hash verification, ancestry backfill, request-time availability checks, and normal client reads still use HTTP.
 - `poll_interval` (default `2s`) is the per-upstream EVM `latest` fallback interval, not an additional poll alongside healthy subscriptions. Providers without WebSockets, with rejected/disconnected subscriptions, or without a new verified head within `websocket_idle_timeout` (default 75% of `max_head_age`) are polled. Disconnected streams reconnect with backoff; duplicate headers and unrelated frames do not extend the idle deadline. Configure the idle timeout above normal block spacing and below `max_head_age`, leaving room for the fallback interval and request latency.
 - EVM never polls `safe` or `finalized`. Readiness requires only a fresh `latest` head and an eligible provider. Legacy safe/finalized Redis entries are ignored by EVM reads, readiness, status, and head-age metrics; no Redis flush is needed. Solana continues to poll all three commitments at `poll_interval`.
 - `head_request_timeout` (default `2s`) bounds each coordinator head query and WebSocket setup independently of poll frequency. Startup identity/capability validation runs once per replica, with no periodic revalidation.
@@ -119,9 +111,9 @@ curl http://127.0.0.1:8080/rpc/ethereum \
 - EVM upstreams that fail the per-method EIP-1898 probes remain unavailable for those state reads.
 - DogStatsD metrics are sent over UDP to `datadog.statsd_address`.
 - `coordinator.subscription_active` reports active upstream subscriptions; `coordinator.latest_poll` counts fallback latest probes, and `coordinator.subscription_error` distinguishes acknowledgment and idle failures. These use bounded chain/upstream/failure-class tags.
-- Datadog APM and optional continuous profiling use `datadog.agent_address`; standard `DD_*` environment variables still control other tracer settings.
+- Datadog APM and optional continuous profiling use `datadog.agent_address`.
 - Upstream URLs and headers are never included in status output or metric tags.
-- Put credential-bearing custom headers in `header_envs` (header name to environment-variable name), not directly in YAML.
+- Set custom headers directly in each upstream's `headers` mapping in your local config. Never commit real endpoint credentials or authentication headers.
 - YAML field names are checked strictly; unknown fields and multiple documents fail startup.
 - Availability checks are coalesced and independently cancelable. Negative checks expire after 75 ms, and each chain's cache is bounded to 4,096 entries.
 - Redis publishes every accepted fork transition, including a return to an earlier hash. Duplicate suppression belongs to each live WebSocket connection, not the shared stream.
@@ -141,12 +133,7 @@ go test ./internal/gateway -run '^$' -bench BenchmarkGatewayAcceptedBlockNumber 
 docker build -t rpc-proxy:local .
 ```
 
-The Redis integration test is opt-in so the normal suite has no external dependency:
-
-```sh
-RPC_PROXY_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
-  go test ./internal/head -run TestRedisStoreFencingGenerationAndStream -count=1
-```
+The normal suite has no external Redis dependency. The [Redis integration test](internal/head/redis_integration_test.go) is opt-in; its source documents the separate test-only setup for exercising a real Redis instance.
 
 Short fuzz checks:
 

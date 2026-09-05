@@ -1,3 +1,5 @@
+# Copy to rpc-proxy.yaml and replace the example provider URLs with your endpoints.
+# Keep real credentials in that ignored local file, not in this committed example.
 server:
   listen_address: ":8080"
   admin_address: "127.0.0.1:8081"
@@ -7,7 +9,7 @@ server:
   websocket_queue_size: 256
 
 redis:
-  url_env: REDIS_URL
+  url: "redis://127.0.0.1:6379/0"
   key_prefix: rpc-proxy
   leader_ttl: 5s
   stream_max_length: 4096
@@ -33,14 +35,14 @@ chains:
     reorg_depth: 64
     upstreams:
       - id: provider-a
-        http_url_env: ETHEREUM_PROVIDER_A_HTTP_URL
-        websocket_url_env: ETHEREUM_PROVIDER_A_WS_URL
-        # header_envs:
-        #   Authorization: ETHEREUM_PROVIDER_A_AUTHORIZATION
+        http_url: "https://ethereum-a.example.invalid/rpc"
+        websocket_url: "wss://ethereum-a.example.invalid/ws"
+        # headers:
+        #   Authorization: "Bearer REPLACE_WITH_YOUR_TOKEN"
         max_concurrency: 256
       - id: provider-b
-        http_url_env: ETHEREUM_PROVIDER_B_HTTP_URL
-        websocket_url_env: ETHEREUM_PROVIDER_B_WS_URL
+        http_url: "https://ethereum-b.example.invalid/rpc"
+        websocket_url: "wss://ethereum-b.example.invalid/ws"
         max_concurrency: 256
 
   - name: solana
@@ -53,8 +55,8 @@ chains:
     reorg_depth: 64
     upstreams:
       - id: provider-a
-        http_url_env: SOLANA_PROVIDER_A_HTTP_URL
+        http_url: "https://solana-a.example.invalid/rpc"
         max_concurrency: 256
       - id: provider-b
-        http_url_env: SOLANA_PROVIDER_B_HTTP_URL
+        http_url: "https://solana-b.example.invalid/rpc"
         max_concurrency: 256

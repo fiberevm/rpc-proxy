@@ -93,13 +93,9 @@ chains:
 	}
 }
 
-func TestExampleConfigLoads(t *testing.T) {
-	t.Setenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-	for _, name := range []string{"ETHEREUM_PROVIDER_A_HTTP_URL", "ETHEREUM_PROVIDER_B_HTTP_URL", "SOLANA_PROVIDER_A_HTTP_URL", "SOLANA_PROVIDER_B_HTTP_URL"} {
-		t.Setenv(name, "https://example.invalid/rpc")
-	}
-	for _, name := range []string{"ETHEREUM_PROVIDER_A_WS_URL", "ETHEREUM_PROVIDER_B_WS_URL"} {
-		t.Setenv(name, "wss://example.invalid/ws")
+func TestExampleConfigLoadsWithoutEnvironment(t *testing.T) {
+	for _, name := range []string{"REDIS_URL", "ETHEREUM_PROVIDER_A_HTTP_URL", "ETHEREUM_PROVIDER_A_WS_URL", "ETHEREUM_PROVIDER_B_HTTP_URL", "ETHEREUM_PROVIDER_B_WS_URL", "SOLANA_PROVIDER_A_HTTP_URL", "SOLANA_PROVIDER_B_HTTP_URL"} {
+		t.Setenv(name, "")
 	}
 	cfg, err := Load(filepath.Join("..", "..", "config.example.yaml"))
 	if err != nil {
@@ -107,6 +103,55 @@ func TestExampleConfigLoads(t *testing.T) {
 	}
 	if len(cfg.Chains) != 2 {
 		t.Fatalf("expected two example chains, got %d", len(cfg.Chains))
+	}
+	if cfg.Redis.URL != "redis://127.0.0.1:6379/0" || cfg.Redis.URLEnv != "" {
+		t.Fatalf("expected Redis URL directly from YAML: %+v", cfg.Redis)
+	}
+	expectedURLs := map[string]struct{ http, websocket string }{
+		"ethereum/provider-a": {"https://ethereum-a.example.invalid/rpc", "wss://ethereum-a.example.invalid/ws"},
+		"ethereum/provider-b": {"https://ethereum-b.example.invalid/rpc", "wss://ethereum-b.example.invalid/ws"},
+		"solana/provider-a":   {"https://solana-a.example.invalid/rpc", ""},
+		"solana/provider-b":   {"https://solana-b.example.invalid/rpc", ""},
+	}
+	for _, chain := range cfg.Chains {
+		if len(chain.Upstreams) != 2 {
+			t.Fatalf("expected two upstreams for %s", chain.Name)
+		}
+		for _, upstream := range chain.Upstreams {
+			expected, exists := expectedURLs[chain.Name+"/"+upstream.ID]
+			if !exists || upstream.HTTPURL != expected.http || upstream.WebsocketURL != expected.websocket || upstream.HTTPURLEnv != "" || upstream.WebsocketURLEnv != "" || len(upstream.HeaderEnvs) != 0 {
+				t.Fatalf("expected upstream URLs directly from YAML: %+v", upstream)
+			}
+		}
+	}
+}
+
+func TestLoadInlineAuthenticationHeaders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rpc-proxy.yaml")
+	contents := []byte(`
+redis:
+  url: "redis://127.0.0.1:6379/0"
+chains:
+  - name: ethereum
+    family: evm
+    chain_id: "0x1"
+    upstreams:
+      - id: primary
+        http_url: "https://ethereum-a.example.invalid/rpc"
+        websocket_url: "wss://ethereum-a.example.invalid/ws"
+        headers:
+          Authorization: "Bearer example-token"
+`)
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := cfg.Chains[0].Upstreams[0]
+	if len(upstream.Headers) != 1 || upstream.Headers["Authorization"] != "Bearer example-token" || len(upstream.HeaderEnvs) != 0 {
+		t.Fatalf("inline headers were not preserved: %+v", upstream)
 	}
 }
 
