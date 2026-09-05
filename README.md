@@ -1,10 +1,14 @@
-# Fiber RPC Proxy
+![RPC Proxy — by Fiber](docs/assets/rpc-proxy-banner.png)
+
+# RPC Proxy
+
+Made by [Fiber](https://github.com/fiberevm).
 
 **Guaranteed read consistency across RPC providers.**
 
-For supported EVM state reads, Fiber RPC Proxy returns data from the exact block hash selected for the request—or a consistency error. A lagging provider cannot silently answer from an older block.
+For supported EVM state reads, RPC Proxy returns data from the exact block hash selected for the request—or a consistency error. A lagging provider cannot silently answer from an older block.
 
-RPC providers do not always agree on the latest block. When one provider sees a transaction's block before another, switching providers can make a balance or contract read appear to go backwards. Fiber RPC Proxy is a read-only, multichain JSON-RPC gateway that tracks the freshest verified head observed from your configured providers and pins supported EVM state reads to that hash. Switching providers does not change the state selected for the request.
+RPC providers do not always agree on the latest block. When one provider sees a transaction's block before another, switching providers can make a balance or contract read appear to go backwards. RPC Proxy is a read-only, multichain JSON-RPC gateway that tracks the freshest verified head observed from your configured providers and pins supported EVM state reads to that hash. Switching providers does not change the state selected for the request.
 
 - **Exact-state reads:** supported EVM balance, storage, code, transaction-count, contract-call, and proof reads are pinned by block hash, not a provider's interpretation of `latest`.
 - **Failover without stale fallback:** try another provider or wait for catch-up; if the target remains unavailable, return a consistency error instead of older state.
@@ -14,7 +18,7 @@ RPC providers do not always agree on the latest block. When one provider sees a 
 - **Solana slot floors:** supported reads receive an accepted `minContextSlot`, not an exact historical-state promise.
 - **Observability:** Datadog traces, DogStatsD metrics, structured redacted logs, and private health/status endpoints.
 
-[Quick start](#run-locally) · [Consistency contract](#consistency-contract) · [Operations](#operational-notes) · [Verification](#verification)
+[Quick start](#run-locally) · [Consistency contract](#consistency-contract) · [Reorg handling](#reorg-protection) · [Operations](#operational-notes) · [Verification](#verification)
 
 This is an initial implementation. The [remaining production acceptance work](#remaining-production-acceptance-work) includes real-provider failover drills and the 1,000 RPS load target; those are not claimed as verified production results.
 
@@ -59,6 +63,15 @@ JSON-RPC server errors use `-32070` for consistency unavailable, `-32071` for un
 
 ## Reorg protection
 
+**A detected reorg must not let an old-fork result escape as a successful pinned read.** The proxy handles it in four stages:
+
+1. **Fence:** record the reorg in shared Redis and block new head-targeted reads across every replica while recovery is pending.
+2. **Verify:** find a common ancestor and verify the replacement branch by hash, within the configured `reorg_depth` (64 by default). Unverifiable recovery stays blocked.
+3. **Check in-flight reads:** after all batch items finish, check the shared reorg epoch again. Discard results that crossed a recorded reorg, even if a lagging provider still reports the old block as canonical.
+4. **Recover:** publish the verified accepted head and clear the pending marker. Clients retry against that head; the proxy never silently changes a request's selected block.
+
+For example, a balance read starts at block **100 / hash A**. A provider reports a replacement **100 / hash B**, and the coordinator records the reorg before the read's final check. Even if another provider successfully returns A's balance, the proxy discards it and returns a retryable consistency error. If B becomes the accepted replacement, subsequent `latest` reads pin to B. An ordinary extension to **101**, with A as its parent, does not invalidate the original read.
+
 When the coordinator detects divergent EVM ancestry, it atomically increments a shared Redis `reorg_epoch` and sets `reorg_pending` **before continuing fork recovery**. New head-targeted reads fail closed while this marker is set. An expired leader cannot set or clear it, and a replacement coordinator inherits it.
 
 The coordinator verifies parent hashes and a common ancestor within `reorg_depth`. A longer valid fork may replace the accepted head. Equal-height disagreement keeps the old head but leaves reads fenced while providers disagree; recovery can also finish when healthy eligible providers agree that the existing hash is canonical. Missing ancestry or uncertain recovery leaves the marker set. Merely observing a lagging ancestor is not a reorg.
@@ -66,6 +79,24 @@ The coordinator verifies parent hashes and a common ancestor within `reorg_depth
 Before sending an HTTP response, the gateway re-reads Redis once for the entire request or batch. If the reorg epoch changed, recovery remains pending, the head is stale, or the check fails, it discards every head-targeted result—including local `eth_blockNumber` results and state-dependent upstream errors—and returns `-32070` with `data.retryable: true`. The counter detects **A → B → A** even when the final hash matches the starting hash. No invalidated value or its head diagnostics is returned. Static reads, receipt lookups, and notification behavior retain their separate semantics.
 
 Clients should retry after recovery; retry the whole batch when all results must share one successful snapshot. Subsequent `latest` reads pin to the recovered hash. This adds one Redis round trip per head-targeted HTTP envelope, not additional per-request provider polling. Normal new blocks leave the reorg epoch unchanged.
+
+A read invalidated by a completed reorg returns HTTP 200 with the original JSON-RPC ID, for example:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32070,
+    "message": "Consistent head is unavailable",
+    "data": {
+      "chain": "ethereum",
+      "reason": "reorg_changed",
+      "retryable": true
+    }
+  }
+}
+```
 
 The guarantee is **a consistent result or an error, not guaranteed availability or finality**. Its checkpoint is the final Redis read: a reorg recorded between the request snapshot and that check invalidates the response. No proxy can revoke responses already checked or delivered, detect a fork no trusted provider has reported, or prevent a reorg after the check while bytes are in transit. Coordination assumes all replicas use the same authoritative Redis state; stale Redis replicas or rollback of acknowledged coordination writes are outside this guarantee. Receipt lookup still has no canonical-state guarantee, and Solana retains its slot-floor contract.
 
