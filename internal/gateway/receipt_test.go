@@ -15,9 +15,16 @@ import (
 )
 
 type receiptReply struct {
-	receipt    json.RawMessage
-	rpcError   *jsonrpc.Error
-	httpStatus int
+	receipt        json.RawMessage
+	rpcError       *jsonrpc.Error
+	httpStatus     int
+	beforeResponse func()
+}
+
+func (f *fakeEVM) receiptCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.receiptCalls
 }
 
 func (f *fakeEVM) setReceipt(reply receiptReply) {
@@ -43,7 +50,7 @@ func TestTransformTransactionReceipt(t *testing.T) {
 		{"object hash", `[{"blockHash":"` + transactionHash + `"}]`, true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			prepared, rpcErr := (&Gateway{}).transformRequest(context.Background(), runtime, head.Snapshot{}, jsonrpc.Request{
+			prepared, rpcErr := (&Gateway{}).transformRequest(context.Background(), runtime, evmSnapshot(), jsonrpc.Request{
 				JSONRPC: "2.0", Method: "eth_getTransactionReceipt", Params: json.RawMessage(testCase.parameters),
 			})
 			if testCase.wantError {
@@ -55,7 +62,7 @@ func TestTransformTransactionReceipt(t *testing.T) {
 			if rpcErr != nil {
 				t.Fatal(rpcErr)
 			}
-			if prepared.method != "eth_getTransactionReceipt" || string(prepared.parameters) != testCase.parameters || prepared.receiptHash != transactionHash || prepared.target != nil || prepared.requireEIP1898 {
+			if prepared.method != "eth_getTransactionReceipt" || string(prepared.parameters) != testCase.parameters || prepared.receiptHash != transactionHash || prepared.target == nil || prepared.target.Number != 100 || prepared.requireEIP1898 {
 				t.Fatalf("unexpected receipt transformation: %+v", prepared)
 			}
 		})
@@ -68,6 +75,7 @@ func TestTransformTransactionReceipt(t *testing.T) {
 func TestGatewayReceiptLookupAndFailover(t *testing.T) {
 	transactionHash := testHash('c')
 	receipt := json.RawMessage(`{"transactionHash":"` + transactionHash + `","transactionIndex":"0x0","blockHash":"` + testHash('a') + `","blockNumber":"0x64","from":"0x0000000000000000000000000000000000000001","to":"0x0000000000000000000000000000000000000002","contractAddress":null,"cumulativeGasUsed":"0x5208","gasUsed":"0x5208","effectiveGasPrice":"0x1","status":"0x1","type":"0x2","logs":[],"logsBloom":"0x` + strings.Repeat("0", 512) + `","l1Fee":"0x123"}`)
+	futureReceipt := json.RawMessage(strings.Replace(string(receipt), `"blockNumber":"0x64"`, `"blockNumber":"0x65"`, 1))
 	for _, testCase := range []struct {
 		name          string
 		first, second receiptReply
@@ -79,6 +87,10 @@ func TestGatewayReceiptLookupAndFailover(t *testing.T) {
 		{"HTTP failover", receiptReply{httpStatus: 503}, receiptReply{receipt: receipt}, receipt, false},
 		{"unsupported provider", receiptReply{rpcError: jsonrpc.MethodNotFound("eth_getTransactionReceipt")}, receiptReply{receipt: receipt}, receipt, false},
 		{"pending or unknown transaction", receiptReply{}, receiptReply{}, json.RawMessage("null"), false},
+		{"future then visible receipt", receiptReply{receipt: futureReceipt}, receiptReply{receipt: receipt}, receipt, false},
+		{"future receipt only", receiptReply{receipt: futureReceipt}, receiptReply{}, json.RawMessage("null"), false},
+		{"both providers ahead", receiptReply{receipt: futureReceipt}, receiptReply{receipt: futureReceipt}, json.RawMessage("null"), false},
+		{"future and failed provider", receiptReply{receipt: futureReceipt}, receiptReply{httpStatus: 503}, nil, true},
 		{"null and unsupported provider", receiptReply{}, receiptReply{rpcError: jsonrpc.MethodNotFound("eth_getTransactionReceipt")}, json.RawMessage("null"), false},
 		{"null and failed provider", receiptReply{}, receiptReply{httpStatus: 503}, nil, true},
 		{"wrong transaction receipt", receiptReply{receipt: json.RawMessage(strings.Replace(string(receipt), transactionHash, testHash('d'), 1))}, receiptReply{receipt: receipt}, receipt, false},
@@ -90,10 +102,11 @@ func TestGatewayReceiptLookupAndFailover(t *testing.T) {
 				"a": newFakeEVM(t, 100, testHash('a'), testHash('9')),
 				"b": newFakeEVM(t, 99, testHash('9'), testHash('8')),
 			}
-			proxy, _ := newTestGateway(t, time.Second, []config.UpstreamConfig{
+			proxy, store := newTestGateway(t, time.Second, []config.UpstreamConfig{
 				{ID: "a", HTTPURL: providers["a"].server.URL, MaxConcurrency: 8},
 				{ID: "b", HTTPURL: providers["b"].server.URL, MaxConcurrency: 8},
 			})
+			store.Set(head.Head{Chain: "test", Family: "evm", Commitment: head.Latest, Number: 100, Hash: testHash('a'), ParentHash: testHash('9'), ObservedAt: time.Now()})
 			// Set the first and second replies after validation establishes latency ranking.
 			candidates := proxy.runtimes["test"].Candidates(false)
 			providers[candidates[0].ID].setReceipt(testCase.first)
@@ -120,7 +133,7 @@ func TestGatewayReceiptLookupAndFailover(t *testing.T) {
 			if response.Error != nil || string(response.Result) != string(testCase.want) {
 				t.Fatalf("unexpected receipt response: %s", recorder.Body.String())
 			}
-			if recorder.Header().Get("X-RPC-Consistency") != "transaction-hash-lookup" || recorder.Header().Get("X-RPC-Head-Hash") != "" || recorder.Header().Get("X-RPC-Upstream") == "" {
+			if recorder.Header().Get("X-RPC-Consistency") != "pinned-head-ceiling" || recorder.Header().Get("X-RPC-Head-Hash") != testHash('a') || recorder.Header().Get("X-RPC-Head-Number") != "0x64" || recorder.Header().Get("X-RPC-Upstream") == "" {
 				t.Fatalf("misleading receipt headers: %v", recorder.Header())
 			}
 		})

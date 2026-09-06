@@ -8,6 +8,14 @@ server:
   max_batch_size: 100
   websocket_queue_size: 256
 
+# Per-process cache for hash-pinned EVM reads, verified receipts and ancestry headers.
+cache:
+  disabled: false
+  max_entries: 4096
+  max_bytes: 67108864 # 64 MiB for retained keys, results and upstream IDs.
+  max_entry_bytes: 1048576 # Larger results are returned but not retained.
+  ttl: 5m # Retention only; latest reads still select a fresh head on every request.
+
 redis:
   url: "redis://127.0.0.1:6379/0"
   key_prefix: rpc-proxy
@@ -32,7 +40,7 @@ chains:
     head_request_timeout: 2s
     websocket_idle_timeout: 20s # Restore HTTP fallback if no new verified head arrives.
     max_head_age: 30s
-    reorg_depth: 64
+    reorg_depth: 64 # Also bounds numeric block selection and receipt-cache ancestry walks.
     upstreams:
       - id: provider-a
         http_url: "https://ethereum-a.example.invalid/rpc"

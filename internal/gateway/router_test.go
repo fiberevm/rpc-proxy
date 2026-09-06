@@ -17,6 +17,7 @@ import (
 	"github.com/fiberevm/rpc-proxy/internal/config"
 	"github.com/fiberevm/rpc-proxy/internal/head"
 	"github.com/fiberevm/rpc-proxy/internal/jsonrpc"
+	"github.com/fiberevm/rpc-proxy/internal/services/requestcache"
 	"github.com/fiberevm/rpc-proxy/internal/telemetry"
 	"github.com/fiberevm/rpc-proxy/internal/utils"
 )
@@ -32,6 +33,7 @@ type fakeEVM struct {
 	stateReplyHook func()
 	stateError     *jsonrpc.Error
 	receipt        receiptReply
+	receiptCalls   int
 	mu             sync.Mutex
 	server         *httptest.Server
 }
@@ -72,7 +74,11 @@ func (f *fakeEVM) serveHTTP(w http.ResponseWriter, request *http.Request) {
 		}
 		f.mu.Lock()
 		reply := f.receipt
+		f.receiptCalls++
 		f.mu.Unlock()
+		if reply.beforeResponse != nil {
+			reply.beforeResponse()
+		}
 		if reply.httpStatus != 0 {
 			w.WriteHeader(reply.httpStatus)
 			return
@@ -396,7 +402,7 @@ func newTestGateway(t *testing.T, timeout time.Duration, upstreams []config.Upst
 		t.Fatal(err)
 	}
 	cfg := &config.Config{Server: config.ServerConfig{RequestTimeout: config.Duration(timeout), MaxBodyBytes: 1 << 20, MaxBatchSize: 100, WebsocketQueueSize: 16}}
-	chainConfig := config.ChainConfig{Name: "test", Family: "evm", ChainID: "0x1", PollInterval: config.Duration(20 * time.Millisecond), MaxHeadAge: config.Duration(5 * time.Second), ReorgDepth: 16, Upstreams: upstreams}
+	chainConfig := config.ChainConfig{Name: "test", Family: "evm", ChainID: "0x1", PollInterval: config.Duration(20 * time.Millisecond), HeadRequestTimeout: config.Duration(time.Second), MaxHeadAge: config.Duration(5 * time.Second), ReorgDepth: 16, Upstreams: upstreams}
 	runtime := chain.NewRuntime(chainConfig, tel)
 	validationCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	if err := runtime.Validate(validationCtx); err != nil {
@@ -404,6 +410,7 @@ func newTestGateway(t *testing.T, timeout time.Duration, upstreams []config.Upst
 	}
 	cancel()
 	store := head.NewMemoryStore()
-	gateway := NewGateway(Options{Config: cfg, Store: store, Runtimes: map[string]*chain.Runtime{"test": runtime}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Telemetry: tel})
+	responseCache := requestcache.NewService(requestcache.Options{Config: config.CacheConfig{MaxEntries: 32, MaxBytes: 1 << 20, MaxEntryBytes: 1 << 16, TTL: config.Duration(time.Minute)}, LoadTimeout: timeout})
+	gateway := NewGateway(Options{Config: cfg, Store: store, Runtimes: map[string]*chain.Runtime{"test": runtime}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Telemetry: tel, Cache: responseCache})
 	return gateway, store
 }

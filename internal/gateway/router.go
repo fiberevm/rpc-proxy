@@ -18,6 +18,8 @@ import (
 	"github.com/fiberevm/rpc-proxy/internal/config"
 	"github.com/fiberevm/rpc-proxy/internal/head"
 	"github.com/fiberevm/rpc-proxy/internal/jsonrpc"
+	"github.com/fiberevm/rpc-proxy/internal/services/receipts"
+	"github.com/fiberevm/rpc-proxy/internal/services/requestcache"
 	"github.com/fiberevm/rpc-proxy/internal/telemetry"
 	"github.com/fiberevm/rpc-proxy/internal/upstream"
 	"github.com/fiberevm/rpc-proxy/internal/utils"
@@ -29,6 +31,8 @@ type Gateway struct {
 	runtimes  map[string]*chain.Runtime
 	logger    *slog.Logger
 	telemetry *telemetry.Telemetry
+	cache     *requestcache.Service
+	receipts  map[string]*receipts.Service
 }
 
 // Options contains the validated dependencies required to serve RPC traffic.
@@ -38,23 +42,35 @@ type Options struct {
 	Runtimes  map[string]*chain.Runtime
 	Logger    *slog.Logger
 	Telemetry *telemetry.Telemetry
+	Cache     *requestcache.Service
 }
 
 type processedResponse struct {
-	response      jsonrpc.Response
-	upstream      string
-	target        *head.Head
-	receiptLookup bool
+	response        jsonrpc.Response
+	upstream        string
+	target          *head.Head
+	cacheStatus     string
+	receiptLookup   bool
+	boundaryChecked bool
+	unverifiedRead  bool
 }
 
 // NewGateway builds an HTTP and WebSocket gateway from validated configuration and injected services.
 func NewGateway(options Options) *Gateway {
+	receiptVerifiers := make(map[string]*receipts.Service)
+	for chainName, runtime := range options.Runtimes {
+		if runtime.Config.Family == "evm" {
+			receiptVerifiers[chainName] = receipts.NewService(receipts.Options{Blocks: runtime, Cache: options.Cache, MaxDepth: runtime.Config.ReorgDepth})
+		}
+	}
 	return &Gateway{
 		config:    options.Config,
 		store:     options.Store,
 		runtimes:  options.Runtimes,
 		logger:    options.Logger,
 		telemetry: options.Telemetry,
+		cache:     options.Cache,
+		receipts:  receiptVerifiers,
 	}
 }
 
@@ -106,17 +122,20 @@ func (g *Gateway) ServeRPC(w http.ResponseWriter, request *http.Request, chainNa
 		g.telemetry.Count("request", 1, "chain:"+chainName, "family:"+runtime.Config.Family, "outcome:"+outcome)
 		g.telemetry.Distribution("request.duration", float64(time.Since(started).Microseconds())/1000, "chain:"+chainName, "family:"+runtime.Config.Family)
 	}()
-	redisCtx, finishRedis := g.telemetry.Span(ctx, "redis.snapshot", "chain:"+chainName, "operation:snapshot")
-	snapshot, err := g.store.Snapshot(redisCtx, chainName)
-	finishRedis(err)
-	if err != nil {
-		requestErr = err
-		g.telemetry.Count("redis.failure", 1, "chain:"+chainName, "operation:snapshot")
-		g.telemetry.Count("consistency.failure", 1, "chain:"+chainName, "failure_class:redis")
-		g.writeEnvelope(w, requests, batch, func(request jsonrpc.Request) jsonrpc.Response {
-			return jsonrpc.Failure(request.ID, jsonrpc.ConsistencyUnavailable(map[string]any{"chain": chainName, "reason": "head store unavailable"}))
-		})
-		return
+	var snapshot head.Snapshot
+	var snapshotErr error
+	for _, rpcRequest := range requests {
+		if g.isStaticMethod(rpcRequest.Method, runtime.Config.Family) {
+			continue
+		}
+		redisCtx, finishRedis := g.telemetry.Span(ctx, "redis.snapshot", "chain:"+chainName, "operation:snapshot")
+		snapshot, snapshotErr = g.store.Snapshot(redisCtx, chainName)
+		finishRedis(snapshotErr)
+		if snapshotErr != nil {
+			g.telemetry.Count("redis.failure", 1, "chain:"+chainName, "operation:snapshot")
+			g.telemetry.Count("consistency.failure", 1, "chain:"+chainName, "failure_class:redis")
+		}
+		break
 	}
 	responses := make([]processedResponse, len(requests))
 	include := make([]bool, len(requests))
@@ -128,6 +147,11 @@ func (g *Gateway) ServeRPC(w http.ResponseWriter, request *http.Request, chainNa
 		} else {
 			include[index] = true
 		}
+		// Static items remain available even when another batch item needs an unavailable store.
+		if snapshotErr != nil && !g.isStaticMethod(rpcRequest.Method, runtime.Config.Family) {
+			responses[index] = processedResponse{response: jsonrpc.Failure(rpcRequest.ID, jsonrpc.ConsistencyUnavailable(map[string]any{"chain": chainName, "reason": "head store unavailable"}))}
+			continue
+		}
 		wg.Add(1)
 		go func() { defer wg.Done(); responses[index] = g.process(ctx, runtime, snapshot, rpcRequest) }()
 	}
@@ -135,9 +159,17 @@ func (g *Gateway) ServeRPC(w http.ResponseWriter, request *http.Request, chainNa
 	g.fenceEVMResponses(ctx, evmResponseFence{runtime: runtime, snapshot: snapshot, responses: responses})
 	filtered := make([]jsonrpc.Response, 0, len(responses))
 	selectedUpstream := ""
+	cacheStatus := ""
 	for i, response := range responses {
 		if include[i] {
 			filtered = append(filtered, response.response)
+			if response.cacheStatus != "" {
+				if cacheStatus == "" {
+					cacheStatus = response.cacheStatus
+				} else if cacheStatus != response.cacheStatus {
+					cacheStatus = "mixed"
+				}
+			}
 			if response.upstream != "" {
 				if selectedUpstream == "" {
 					selectedUpstream = response.upstream
@@ -149,6 +181,9 @@ func (g *Gateway) ServeRPC(w http.ResponseWriter, request *http.Request, chainNa
 	}
 	if selectedUpstream != "" {
 		w.Header().Set("X-RPC-Upstream", selectedUpstream)
+	}
+	if cacheStatus != "" {
+		w.Header().Set("X-RPC-Cache", cacheStatus)
 	}
 	g.setResponseHeadHeaders(w.Header(), runtime.Config.Family, responses)
 	if len(filtered) == 0 {
@@ -207,10 +242,17 @@ func (g *Gateway) process(ctx context.Context, runtime *chain.Runtime, snapshot 
 		return processedResponse{response: jsonrpc.Failure(request.ID, jsonrpc.ConsistencyUnavailable(map[string]any{"chain": runtime.Config.Name, "reason": "accepted head is stale", "commitment": prepared.target.Commitment}))}
 	}
 	if prepared.localResponse != nil {
-		return processedResponse{response: jsonrpc.Success(request.ID, prepared.localResponse), upstream: "proxy", target: prepared.target}
+		cacheStatus := "local"
+		if prepared.target == nil {
+			cacheStatus = "static"
+		}
+		g.telemetry.Count("cache.request", 1, "chain:"+runtime.Config.Name, "method:"+request.Method, "outcome:"+cacheStatus)
+		return processedResponse{response: jsonrpc.Success(request.ID, prepared.localResponse), upstream: "proxy", target: prepared.target, cacheStatus: cacheStatus}
 	}
 	routeCtx, finishRoute := g.telemetry.Span(ctx, "rpc.route", "chain:"+runtime.Config.Name, "method:"+g.metricMethod(request.Method, runtime.Config.Family))
-	upstreamResponse, upstreamID, upstreamErr := g.route(routeCtx, runtime, prepared)
+	lookup, upstreamErr := g.getResponse(routeCtx, responseRequest{runtime: runtime, snapshot: snapshot, prepared: prepared})
+	upstreamResponse, upstreamID := lookup.Response.Payload, lookup.Response.Upstream
+	g.telemetry.Count("cache.request", 1, "chain:"+runtime.Config.Name, "method:"+g.metricMethod(request.Method, runtime.Config.Family), "outcome:"+lookup.Status)
 	if upstreamErr != nil {
 		finishRoute(upstreamErr, "upstream:"+upstreamID)
 	} else {
@@ -221,9 +263,13 @@ func (g *Gateway) process(ctx context.Context, runtime *chain.Runtime, snapshot 
 		attributes := []any{"chain", runtime.Config.Name, "method", request.Method, "rpc_error_code", upstreamErr.Code}
 		attributes = append(attributes, g.telemetry.TraceAttrs(ctx)...)
 		g.logger.WarnContext(ctx, "rpc request failed", attributes...)
-		return processedResponse{response: jsonrpc.Failure(request.ID, upstreamErr), upstream: upstreamID, target: prepared.target}
+		return processedResponse{response: jsonrpc.Failure(request.ID, upstreamErr), upstream: upstreamID, target: prepared.target, cacheStatus: lookup.Status}
 	}
-	return processedResponse{response: jsonrpc.Success(request.ID, upstreamResponse), upstream: upstreamID, target: prepared.target, receiptLookup: prepared.receiptHash != ""}
+	return processedResponse{
+		response: jsonrpc.Success(request.ID, upstreamResponse), upstream: upstreamID, target: prepared.target,
+		cacheStatus: lookup.Status, receiptLookup: prepared.receiptHash != "", boundaryChecked: len(prepared.verifyBoundaries) > 0,
+		unverifiedRead: runtime.Config.Family == "solana" && g.isSolanaUnpinnedRead(request.Method),
+	}
 }
 
 func (g *Gateway) route(ctx context.Context, runtime *chain.Runtime, prepared preparedRequest) (json.RawMessage, string, *jsonrpc.Error) {
@@ -246,7 +292,7 @@ func (g *Gateway) route(ctx context.Context, runtime *chain.Runtime, prepared pr
 			if prepared.requireEIP1898 && !candidate.SupportsPinnedMethod(prepared.method) {
 				continue
 			}
-			if prepared.target != nil {
+			if prepared.target != nil && prepared.receiptHash == "" {
 				probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 				available := false
 				var availabilityErr error
@@ -293,15 +339,30 @@ func (g *Gateway) route(ctx context.Context, runtime *chain.Runtime, prepared pr
 			if upstreamCall.Error != nil {
 				return nil, candidate.ID, upstreamCall.Error
 			}
+			if runtime.Config.Family == "evm" && prepared.target != nil {
+				if err := g.verifyEVMResponse(evmResponseVerification{runtime: runtime, prepared: prepared, payload: upstreamCall.Result}); err != nil {
+					runtime.InvalidateAvailability(candidate.ID, *prepared.target)
+					g.telemetry.Count("upstream.response_invalid", 1, "chain:"+runtime.Config.Name, "upstream:"+candidate.ID, "method:"+prepared.method)
+					continue
+				}
+			}
 			if prepared.receiptHash != "" {
 				if bytes.Equal(bytes.TrimSpace(upstreamCall.Result), []byte("null")) {
-					// A lagging transaction index must not hide another provider's receipt.
+					// Try other providers in case this transaction index is behind.
 					nullReceipts++
 					nullReceiptUpstream = candidate.ID
 					continue
 				}
-				if err := g.verifyEVMReceipt(upstreamCall.Result, prepared.receiptHash); err != nil {
+				block, err := g.getEVMReceiptBlock(upstreamCall.Result, prepared.receiptHash)
+				if err != nil {
 					g.telemetry.Count("upstream.receipt_invalid", 1, "chain:"+runtime.Config.Name, "upstream:"+candidate.ID, "method:"+prepared.method)
+					continue
+				}
+				if block.Number > prepared.target.Number {
+					// Providers may be ahead of the proxy. Future inclusion is not yet
+					// visible to this request, even if the shared head advances meanwhile.
+					nullReceipts++
+					nullReceiptUpstream = candidate.ID
 					continue
 				}
 			}
@@ -352,7 +413,7 @@ func (g *Gateway) route(ctx context.Context, runtime *chain.Runtime, prepared pr
 			if nullReceipts > 0 && nullReceipts == eligible {
 				return json.RawMessage("null"), nullReceiptUpstream, nil
 			}
-			// A failed or malformed lookup is not evidence that the receipt is absent.
+			// Transport/protocol failures are not evidence of a missing receipt.
 			break
 		}
 		if eligible == 0 && len(attempted) >= len(candidates) && len(candidates) > 0 {
@@ -369,22 +430,23 @@ func (g *Gateway) route(ctx context.Context, runtime *chain.Runtime, prepared pr
 	return nil, "", jsonrpc.ConsistencyUnavailable(g.getTargetErrorData(runtime.Config.Name, prepared.target, attempted))
 }
 
-func (g *Gateway) verifyEVMReceipt(receipt json.RawMessage, transactionHash string) error {
+func (g *Gateway) getEVMReceiptBlock(receipt json.RawMessage, transactionHash string) (head.Head, error) {
 	var inclusion struct {
 		TransactionHash string `json:"transactionHash"`
 		BlockHash       string `json:"blockHash"`
 		BlockNumber     string `json:"blockNumber"`
 	}
 	if err := json.Unmarshal(receipt, &inclusion); err != nil {
-		return fmt.Errorf("decode transaction receipt: %w", err)
+		return head.Head{}, fmt.Errorf("decode transaction receipt: %w", err)
 	}
 	if !utils.IsEVMHash(inclusion.TransactionHash) || !strings.EqualFold(inclusion.TransactionHash, transactionHash) || !utils.IsEVMHash(inclusion.BlockHash) {
-		return errors.New("receipt has an invalid transaction or block hash")
+		return head.Head{}, errors.New("receipt has an invalid transaction or block hash")
 	}
-	if _, err := utils.ParseEVMQuantity(inclusion.BlockNumber); err != nil {
-		return fmt.Errorf("invalid receipt block number: %w", err)
+	blockNumber, err := utils.ParseEVMQuantity(inclusion.BlockNumber)
+	if err != nil {
+		return head.Head{}, fmt.Errorf("invalid receipt block number: %w", err)
 	}
-	return nil
+	return head.Head{Family: "evm", Number: blockNumber, Hash: inclusion.BlockHash}, nil
 }
 
 func (g *Gateway) verifyEVMBoundaries(ctx context.Context, runtime *chain.Runtime, candidate *upstream.Client, targets []head.Head) bool {
@@ -425,22 +487,39 @@ func (g *Gateway) getTargetErrorData(chainName string, target *head.Head, attemp
 func (g *Gateway) setResponseHeadHeaders(headers http.Header, family string, responses []processedResponse) {
 	var acceptedHead *head.Head
 	hasReceiptLookup := false
+	hasOtherTarget := false
+	boundaryChecked := false
+	unverifiedRead := false
 	for _, response := range responses {
-		hasReceiptLookup = hasReceiptLookup || response.receiptLookup
+		unverifiedRead = unverifiedRead || response.unverifiedRead
 		if response.target == nil || response.response.Error != nil {
 			continue
 		}
-		if acceptedHead != nil && (acceptedHead.Identity() != response.target.Identity() || acceptedHead.Commitment != response.target.Commitment) {
-			headers.Set("X-RPC-Consistency", "mixed-targets")
-			return
+		hasReceiptLookup = hasReceiptLookup || response.receiptLookup
+		hasOtherTarget = hasOtherTarget || !response.receiptLookup
+		if acceptedHead != nil {
+			sameTarget := acceptedHead.Identity() == response.target.Identity() && acceptedHead.Commitment == response.target.Commitment
+			if family == "evm" {
+				// A numeric selector and latest can identify the very same EVM state.
+				sameTarget = strings.EqualFold(acceptedHead.Hash, response.target.Hash)
+			}
+			if !sameTarget {
+				headers.Set("X-RPC-Consistency", "mixed-targets")
+				return
+			}
 		}
+		boundaryChecked = boundaryChecked || response.boundaryChecked
 		acceptedHead = response.target
 	}
-	if hasReceiptLookup {
+	if hasReceiptLookup && hasOtherTarget {
+		headers.Set("X-RPC-Consistency", "mixed-targets")
+		return
+	}
+	if unverifiedRead {
 		if acceptedHead != nil {
 			headers.Set("X-RPC-Consistency", "mixed-targets")
 		} else {
-			headers.Set("X-RPC-Consistency", "transaction-hash-lookup")
+			headers.Set("X-RPC-Consistency", "unverified")
 		}
 		return
 	}
@@ -453,6 +532,14 @@ func (g *Gateway) setResponseHeadHeaders(headers http.Header, family string, res
 		}
 		headers.Set("X-RPC-Head-Hash", acceptedHead.Hash)
 		headers.Set("X-RPC-Consistency", "exact-block-hash")
+		if hasReceiptLookup {
+			// These headers identify the receipt visibility cutoff, not its inclusion block.
+			headers.Set("X-RPC-Consistency", "pinned-head-ceiling")
+		}
+		if boundaryChecked {
+			// The hash identifies the range boundary, not an atomic execution snapshot.
+			headers.Set("X-RPC-Consistency", "boundary-checked")
+		}
 	} else {
 		headers.Set("X-RPC-Head-Slot", fmt.Sprint(acceptedHead.Number))
 		headers.Set("X-RPC-Consistency", "minimum-context-slot")

@@ -4,7 +4,7 @@
 
 Made by [Fiber](https://github.com/fiberevm).
 
-**Guaranteed read consistency across RPC providers.**
+**Exact-block EVM reads across RPC providers.**
 
 RPC providers can lag behind each other. RPC Proxy picks a verified block for each request. Supported EVM state reads use that exact block hash.
 
@@ -60,15 +60,33 @@ See [config.example.yaml](config.example.yaml) for all settings. Restart after c
 
 - **EVM:** supported state reads use a block hash with `requireCanonical: true`.
 - **Solana:** supported reads use `minContextSlot`. This sets a minimum slot, not an exact snapshot.
-- **Batches:** all `latest` reads in a batch use one snapshot. Later requests may use newer heads.
+- **Batches:** all EVM `latest` reads in a batch use one snapshot. Later requests may use newer heads. Solana items share a slot floor, but can return different slots and forks.
 - **Latest:** the newest valid head seen by your trusted providers. Not a promise about the whole network.
 - **Read-only:** writes, unknown methods, and EVM `pending`, `safe`, and `finalized` reads are rejected.
 
-EVM state methods include `eth_getBalance`, `eth_getStorageAt`, `eth_getTransactionCount`, `eth_getCode`, `eth_call`, and `eth_getProof`. Explicit past block numbers and hashes are also supported. See the [method registry](internal/gateway/transform.go) for the full list.
+EVM state methods include `eth_getBalance`, `eth_getStorageAt`, `eth_getTransactionCount`, `eth_getCode`, `eth_call`, and `eth_getProof`. Their numeric selectors and block-number lookup methods follow parent hashes from the accepted snapshot, bounded by `reorg_depth` and `head_request_timeout`. Numbers above the snapshot or outside that ancestry window fail closed; use an explicit block hash for older state history. A number equal to the accepted height uses its accepted hash directly. See the [method registry](internal/gateway/transform.go) for the full list.
 
-`eth_getTransactionReceipt` takes one transaction hash. The proxy tries other providers on `null`. A lookup error is not treated as a missing receipt. Receipt reads do not promise the same snapshot as state reads or prove that a block is final.
+`eth_getTransactionReceipt` takes one transaction hash and uses the request's pinned head as a height ceiling. A receipt above that height is treated as not yet included; the proxy tries other providers and returns `null` if all eligible replies are null or above the ceiling. A lookup error is not treated as a missing receipt. The cutoff also applies to cache hits and stays fixed if the head advances during the request. Receipt responses report `X-RPC-Consistency: pinned-head-ceiling` and the cutoff head in `X-RPC-Head-Number`/`X-RPC-Head-Hash`. This height check does not prove canonical inclusion or finality.
 
-Log ranges and fee history check boundary hashes. They cannot promise one snapshot if a provider changes forks during the read.
+`eth_getLogs` rewrites `latest`, including omitted bounds, to the request's pinned head. Multi-block queries remain range queries, so old `fromBlock` values do not require an ancestry walk. Numeric bounds above the pin are rejected, and returned logs must fall within the requested range. The proxy checks the pinned head's hash before and after the query. Single-block queries within the ancestry window use a block hash; older single-block numeric queries use the range path. Range reads and fee history report `X-RPC-Consistency: boundary-checked`; they do not promise atomic fork consistency during the query. Solana `getBlock`, `getBlockTime`, and `getBlockCommitment` report `unverified`; batches combining them with slot-floor reads report `mixed-targets`.
+
+The exact-block guarantee assumes trusted providers honor the hash selector; startup probes and response identity checks cannot prove arbitrary returned state cryptographically. The proxy does not make every supported method an exact snapshot read. See the [consistency audit](docs/consistency-audit.md) for the guarantees, fixes, and limits.
+
+## Request caching
+
+`eth_chainId` and Solana `getGenesisHash` return the configured identity without calling Redis or an upstream. Startup still checks provider identities. `eth_blockNumber` already uses the accepted head; it keeps the freshness and reorg checks.
+
+Successful EVM state reads, block-hash lookups, and single-block logs use a bounded cache in each proxy process. Keys include the chain, method, transformed parameters, exact block hash, and reorg epoch. Repeated `latest` reads at one head share results; a new head selects different entries. Concurrent identical misses share one upstream operation, with independent client deadlines.
+
+Non-null transaction receipts are cached after their inclusion block is verified through the accepted head's parent links. This walk is bounded by `reorg_depth` and `head_request_timeout`; ancestor headers share the same bounded cache. Receipt keys use the chain, transaction hash and reorg epoch, so entries survive normal head advancement and are invalidated by recorded reorgs. Receipts whose inclusion cannot be verified retain the existing uncached lookup behavior. No finality wait is required.
+
+Cache hits retain the normal shared-store admission and final reorg checks, including the batch fence. All receipt responses, including nulls and uncached lookups, join that fence. Errors and `null` are never retained. Receipt loads share work only when their pinned heads match; verified positive entries remain reusable across head advancement with the caller's height ceiling reapplied. Log ranges, fee history, and Solana state reads stay uncached. Historical state/block-number lookups require verified parent traversal before consulting the result cache; the accepted height needs no upstream number lookup.
+
+The defaults are 4,096 entries, 64 MiB of retained keys/results/upstream IDs, a 1 MiB entry limit, and five-minute retention. Entry metadata and in-flight responses use additional memory. Set `cache.disabled: true` to disable caching and request coalescing; local responses remain enabled. See [config.example.yaml](config.example.yaml).
+
+`X-RPC-Cache` reports `static`, `local`, `hit`, `miss`, `shared`, or `bypass`; batches with different reported outcomes use `mixed`. `X-RPC-Upstream` on a hit identifies the original provider. Datadog's `rpc_proxy.cache.request` counter is tagged by chain, method, and outcome.
+
+See the [method-by-method cache policy](docs/request-caching.md) for the reasoning and next candidates.
 
 ## Reorg protection
 
@@ -80,7 +98,7 @@ A reorg replaces part of the chain. The proxy handles it like this:
 
 At equal height, reads stay blocked while providers disagree. A longer valid branch can win. Recovery can also finish if providers agree on the existing head. Missing chain history keeps reads blocked. Recovery beyond the depth limit needs operator help.
 
-Reads already in progress get a final Redis check. If a reorg was recorded after the request chose its head, the results are discarded. The check covers the whole batch, even if some items finished earlier. Static reads and receipt lookups keep their separate rules.
+Reads already in progress get a final Redis check. If a reorg was recorded after the request chose its head, the results are discarded. The check covers the whole batch, including receipt results and nulls, even if some items finished earlier. Static identity reads do not depend on the head.
 
 For example, a read starts at block **100 / hash A**. The proxy records a switch to B before the final check. The old result is discarded, even if a provider still accepts A. The client gets `-32070` with `retryable: true`. A new read after recovery uses B.
 

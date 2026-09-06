@@ -354,7 +354,7 @@ func testRuntime(t testHelper, family string) *chain.Runtime {
 
 func evmSnapshot() head.Snapshot {
 	return head.Snapshot{Chain: "test", Heads: map[string]head.Head{
-		head.Latest:    {Chain: "test", Family: "evm", Commitment: head.Latest, Number: 100, Hash: testHash('a')},
+		head.Latest:    {Chain: "test", Family: "evm", Commitment: head.Latest, Number: 100, Hash: testHash('a'), ParentHash: testHash('9')},
 		head.Safe:      {Chain: "test", Family: "evm", Commitment: head.Safe, Number: 99, Hash: testHash('b')},
 		head.Finalized: {Chain: "test", Family: "evm", Commitment: head.Finalized, Number: 90, Hash: testHash('c')},
 	}}

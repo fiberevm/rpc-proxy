@@ -24,6 +24,17 @@ type preparedRequest struct {
 	verifyContextSlot bool
 	unwrapContext     bool
 	receiptHash       string
+	logRange          *evmLogRange
+}
+
+type evmLogRange struct {
+	from uint64
+	to   uint64
+}
+
+type evmLogBoundRequest struct {
+	selector string
+	accepted head.Head
 }
 
 type evmBlockMethod struct {
@@ -38,6 +49,9 @@ type evmBlockTargetRequest struct {
 }
 
 func (g *Gateway) transformRequest(ctx context.Context, runtime *chain.Runtime, snapshot head.Snapshot, request jsonrpc.Request) (preparedRequest, *jsonrpc.Error) {
+	if g.isStaticMethod(request.Method, runtime.Config.Family) {
+		return g.prepareStaticRequest(runtime, request)
+	}
 	if g.isWriteMethod(request.Method, runtime.Config.Family) {
 		return preparedRequest{}, jsonrpc.WritesDisabled(request.Method)
 	}
@@ -103,6 +117,9 @@ func (g *Gateway) transformEVMRequest(ctx context.Context, runtime *chain.Runtim
 	}
 
 	if request.Method == "eth_blockNumber" {
+		if len(parameters) != 0 {
+			return preparedRequest{}, jsonrpc.InvalidParams("eth_blockNumber does not accept parameters")
+		}
 		target, targetErr := g.getSnapshotHead(snapshot, head.Latest)
 		if targetErr != nil {
 			return preparedRequest{}, targetErr
@@ -156,8 +173,12 @@ func (g *Gateway) transformEVMRequest(ctx context.Context, runtime *chain.Runtim
 		if encodeErr != nil {
 			return preparedRequest{}, encodeErr
 		}
-		// Receipt lookup has no block selector and is not an EIP-1898 state read.
-		return preparedRequest{method: request.Method, parameters: encodedParameters, receiptHash: transactionHash}, nil
+		target, targetErr := g.getSnapshotHead(snapshot, head.Latest)
+		if targetErr != nil {
+			return preparedRequest{}, targetErr
+		}
+		// Keep the upstream hash lookup, but cap receipt visibility at this batch's head.
+		return preparedRequest{method: request.Method, parameters: encodedParameters, receiptHash: transactionHash, target: &target}, nil
 	}
 
 	if g.isEVMHeadNeutralMethod(request.Method) {
@@ -225,48 +246,73 @@ func (g *Gateway) transformEVMLogs(ctx context.Context, runtime *chain.Runtime, 
 	if json.Unmarshal(fromBlock, &fromSelector) != nil || fromSelector == "" || json.Unmarshal(toBlock, &toSelector) != nil || toSelector == "" {
 		return preparedRequest{}, jsonrpc.InvalidParams("log bounds must be block numbers or tags")
 	}
-	fromRequest := evmBlockTargetRequest{runtime: runtime, snapshot: snapshot, blockReference: fromBlock}
-	fromTarget, fromErr := g.getEVMBlock(ctx, fromRequest)
+	accepted, headErr := g.getSnapshotHead(snapshot, head.Latest)
+	if headErr != nil {
+		return preparedRequest{}, headErr
+	}
+	fromNumber, fromErr := g.getEVMLogBound(evmLogBoundRequest{selector: fromSelector, accepted: accepted})
 	if fromErr != nil {
 		return preparedRequest{}, fromErr
 	}
-	toRequest := evmBlockTargetRequest{runtime: runtime, snapshot: snapshot, blockReference: toBlock}
-	toTarget, toErr := g.getEVMBlock(ctx, toRequest)
+	toNumber, toErr := g.getEVMLogBound(evmLogBoundRequest{selector: toSelector, accepted: accepted})
 	if toErr != nil {
 		return preparedRequest{}, toErr
 	}
-	if fromTarget.Number > toTarget.Number {
+	if fromNumber > toNumber {
 		return preparedRequest{}, jsonrpc.InvalidParams("fromBlock exceeds toBlock")
 	}
 
-	if fromTarget.Hash == toTarget.Hash {
+	if fromNumber == toNumber && accepted.Number-fromNumber <= uint64(runtime.Config.ReorgDepth) {
+		target, targetErr := g.getEVMBlock(ctx, evmBlockTargetRequest{runtime: runtime, snapshot: snapshot, blockReference: toBlock})
+		if targetErr != nil {
+			return preparedRequest{}, targetErr
+		}
 		delete(filter, "fromBlock")
 		delete(filter, "toBlock")
-		blockHash, err := json.Marshal(toTarget.Hash)
+		blockHash, err := json.Marshal(target.Hash)
 		if err != nil {
 			return preparedRequest{}, jsonrpc.InternalError("encode EVM log block hash")
 		}
 		filter["blockHash"] = blockHash
 
-		return g.prepareEVMLogRequest(filter, toTarget, nil)
+		return g.prepareEVMLogRequest(filter, target, nil)
 	}
 
-	fromNumber, err := json.Marshal(utils.FormatEVMQuantity(fromTarget.Number))
+	encodedFrom, err := json.Marshal(utils.FormatEVMQuantity(fromNumber))
 	if err != nil {
 		return preparedRequest{}, jsonrpc.InternalError("encode EVM log range start")
 	}
-	toNumber, err := json.Marshal(utils.FormatEVMQuantity(toTarget.Number))
+	encodedTo, err := json.Marshal(utils.FormatEVMQuantity(toNumber))
 	if err != nil {
 		return preparedRequest{}, jsonrpc.InternalError("encode EVM log range end")
 	}
-	filter["fromBlock"] = fromNumber
-	filter["toBlock"] = toNumber
+	filter["fromBlock"] = encodedFrom
+	filter["toBlock"] = encodedTo
 
-	boundaries := []head.Head{fromTarget}
-	if !strings.EqualFold(fromTarget.Hash, toTarget.Hash) {
-		boundaries = append(boundaries, toTarget)
+	// Keep the range query intact. Pin latest once, without an ancestry walk for
+	// every historical block; the accepted head remains the request's ceiling.
+	prepared, rpcErr := g.prepareEVMLogRequest(filter, accepted, []head.Head{accepted})
+	prepared.logRange = &evmLogRange{from: fromNumber, to: toNumber}
+	return prepared, rpcErr
+}
+
+func (g *Gateway) getEVMLogBound(request evmLogBoundRequest) (uint64, *jsonrpc.Error) {
+	switch request.selector {
+	case head.Latest:
+		return request.accepted.Number, nil
+	case "earliest":
+		return 0, nil
+	case "pending", head.Safe, head.Finalized:
+		return 0, jsonrpc.UnsupportedConsistency("eth_getLogs", "only latest is supported as a live EVM head")
 	}
-	return g.prepareEVMLogRequest(filter, toTarget, boundaries)
+	number, err := utils.ParseEVMQuantity(request.selector)
+	if err != nil {
+		return 0, jsonrpc.InvalidParams("invalid log block number")
+	}
+	if number > request.accepted.Number {
+		return 0, jsonrpc.ConsistencyUnavailable(map[string]any{"chain": request.accepted.Chain, "reason": "log bound exceeds pinned head", "retryable": true})
+	}
+	return number, nil
 }
 
 func (g *Gateway) prepareEVMLogRequest(filter map[string]json.RawMessage, target head.Head, boundaries []head.Head) (preparedRequest, *jsonrpc.Error) {
@@ -510,6 +556,15 @@ func (g *Gateway) hasSolanaContext(method string) bool {
 func (g *Gateway) isSolanaHeadNeutralMethod(method string) bool {
 	switch method {
 	case "getGenesisHash", "getVersion", "getBlock", "getBlockCommitment", "getBlockTime", "getHealth", "getEpochSchedule":
+		return true
+	default:
+		return false
+	}
+}
+
+func (g *Gateway) isSolanaUnpinnedRead(method string) bool {
+	switch method {
+	case "getBlock", "getBlockCommitment", "getBlockTime":
 		return true
 	default:
 		return false

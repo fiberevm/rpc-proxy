@@ -36,6 +36,9 @@ chains:
 	if cfg.Redis.URL != "redis://127.0.0.1:6379/0" || cfg.Server.RequestTimeout.Value() != 5*time.Second {
 		t.Fatalf("defaults or Redis environment not applied: %+v", cfg)
 	}
+	if cfg.Cache.Disabled || cfg.Cache.MaxEntries != 4096 || cfg.Cache.MaxBytes != 64<<20 || cfg.Cache.MaxEntryBytes != 1<<20 || cfg.Cache.TTL.Value() != 5*time.Minute {
+		t.Fatalf("cache defaults not applied: %+v", cfg.Cache)
+	}
 	upstream := cfg.Chains[0].Upstreams[0]
 	if upstream.HTTPURL != "https://example.invalid/rpc" || upstream.Headers["Authorization"] != "Bearer secret" {
 		t.Fatalf("upstream environment not loaded: %+v", upstream)
@@ -46,6 +49,39 @@ chains:
 	chain := cfg.Chains[0]
 	if chain.HeadRequestTimeout.Value() != 2*time.Second || chain.WebsocketIdleTimeout.Value() != 18*time.Second {
 		t.Fatalf("head tracking defaults not applied: %+v", chain)
+	}
+}
+
+func TestCacheAndStaticIdentityConfigurationValidation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*Config)
+		wantError string
+	}{
+		{"entry count", func(cfg *Config) { cfg.Cache.MaxEntries = -1 }, "cache"},
+		{"byte limit", func(cfg *Config) { cfg.Cache.MaxBytes = -1 }, "cache"},
+		{"entry byte limit", func(cfg *Config) { cfg.Cache.MaxEntryBytes = -1 }, "cache"},
+		{"oversized entry limit", func(cfg *Config) { cfg.Cache.MaxEntryBytes = cfg.Cache.MaxBytes + 1 }, "cache"},
+		{"ttl", func(cfg *Config) { cfg.Cache.TTL = -1 }, "cache"},
+		{"invalid identity", func(cfg *Config) { cfg.Chains[0].ChainID = "ethereum" }, "chain_id"},
+		{"noncanonical identity", func(cfg *Config) { cfg.Chains[0].ChainID = "0x01" }, "chain_id"},
+		{"disabled", func(cfg *Config) { cfg.Cache.Disabled = true }, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := Load(filepath.Join("..", "..", "config.example.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.configure(cfg)
+			err = cfg.Validate()
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("expected %s error, got %v", test.wantError, err)
+			}
+		})
 	}
 }
 

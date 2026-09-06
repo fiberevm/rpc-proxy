@@ -273,7 +273,7 @@ func TestGatewayReorgFencesEntireBatch(t *testing.T) {
 			t.Fatalf("batch item escaped fence: %+v", responses[index])
 		}
 	}
-	if responses[2].Error != nil || string(responses[2].Result) != `"0x1"` || responses[3].Error != nil || string(responses[3].Result) != "null" || responses[4].Error == nil || responses[4].Error.Code != jsonrpc.CodeInvalidRequest {
+	if responses[2].Error != nil || string(responses[2].Result) != `"0x1"` || responses[3].Error == nil || responses[3].Error.Code != jsonrpc.CodeConsistencyUnavailable || responses[4].Error == nil || responses[4].Error.Code != jsonrpc.CodeInvalidRequest {
 		t.Fatalf("non-pinned batch semantics changed: %s", recorder.Body.String())
 	}
 	if recorder.Header().Get("X-RPC-Head-Hash") != "" || recorder.Header().Get("X-RPC-Head-Number") != "" {

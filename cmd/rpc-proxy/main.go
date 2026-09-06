@@ -17,6 +17,7 @@ import (
 	"github.com/fiberevm/rpc-proxy/internal/coordinator"
 	"github.com/fiberevm/rpc-proxy/internal/gateway"
 	"github.com/fiberevm/rpc-proxy/internal/head"
+	"github.com/fiberevm/rpc-proxy/internal/services/requestcache"
 	"github.com/fiberevm/rpc-proxy/internal/telemetry"
 )
 
@@ -81,7 +82,8 @@ func run(configPath string, logger *slog.Logger) error {
 		coord := coordinator.NewCoordinator(coordinatorOptions)
 		go coord.Run(ctx)
 	}
-	proxy := gateway.NewGateway(gateway.Options{Config: cfg, Store: store, Runtimes: runtimes, Logger: logger, Telemetry: tel})
+	responseCache := requestcache.NewService(requestcache.Options{Config: cfg.Cache, LoadTimeout: cfg.Server.RequestTimeout.Value()})
+	proxy := gateway.NewGateway(gateway.Options{Config: cfg, Store: store, Runtimes: runtimes, Logger: logger, Telemetry: tel, Cache: responseCache})
 	publicMux := http.NewServeMux()
 	publicMux.Handle("POST /rpc/{chain}", proxy.RPCHandler())
 	publicMux.Handle("GET /ws/{chain}", proxy.WebsocketHandler())

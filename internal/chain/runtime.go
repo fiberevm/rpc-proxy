@@ -65,6 +65,11 @@ type EVMBlockByNumberRequest struct {
 	UpstreamID string
 }
 
+type evmNumberTargetRequest struct {
+	quantity string
+	snapshot head.Snapshot
+}
+
 var (
 	// ErrInvalidEVMBlockReference identifies caller-supplied block references that fail strict validation.
 	ErrInvalidEVMBlockReference = errors.New("invalid EVM block reference")
@@ -242,7 +247,7 @@ func (r *Runtime) probeEVMStateMethods(ctx context.Context, candidate *upstream.
 	candidate.SetEIP1898(anySupported)
 }
 
-// IsValid reports whether the upstream ID passed startup or periodic capability validation.
+// IsValid reports whether the upstream ID passed capability validation at startup.
 func (r *Runtime) IsValid(id string) bool {
 	r.validMu.RLock()
 	defer r.validMu.RUnlock()
@@ -307,7 +312,7 @@ func (r *Runtime) GetEVMBlock(ctx context.Context, blockReference json.RawMessag
 		case "earliest":
 			tagOrQuantity = "0x0"
 		}
-		return r.getEVMBlockByQuantity(ctx, tagOrQuantity)
+		return r.getEVMBlockByQuantity(ctx, evmNumberTargetRequest{quantity: tagOrQuantity, snapshot: snapshot})
 	}
 
 	var object struct {
@@ -330,37 +335,42 @@ func (r *Runtime) GetEVMBlock(ctx context.Context, blockReference json.RawMessag
 	if object.BlockNumber == "" {
 		return head.Head{}, fmt.Errorf("%w: block identifier requires blockHash or blockNumber", ErrInvalidEVMBlockReference)
 	}
-	return r.getEVMBlockByQuantity(ctx, object.BlockNumber)
+	return r.getEVMBlockByQuantity(ctx, evmNumberTargetRequest{quantity: object.BlockNumber, snapshot: snapshot})
 }
 
-func (r *Runtime) getEVMBlockByQuantity(ctx context.Context, quantity string) (head.Head, error) {
-	number, err := utils.ParseEVMQuantity(quantity)
+func (r *Runtime) getEVMBlockByQuantity(ctx context.Context, request evmNumberTargetRequest) (head.Head, error) {
+	number, err := utils.ParseEVMQuantity(request.quantity)
 	if err != nil {
 		return head.Head{}, fmt.Errorf("%w: invalid block number", ErrInvalidEVMBlockReference)
 	}
 
-	var failures []error
-	for _, candidate := range r.Candidates(false) {
-		blockCall, err := r.call(ctx, candidate, "eth_getBlockByNumber", quantity, false)
-		if err != nil {
-			failures = append(failures, fmt.Errorf("query block from upstream %s: %w", candidate.ID, err))
-			continue
-		}
-		if blockCall.Error != nil || string(blockCall.Result) == "null" {
-			continue
-		}
-		block, err := r.ParseEVMHead(EVMHeadParseRequest{Commitment: "explicit", Origin: candidate.ID, Header: blockCall.Result})
-		if err == nil && block.Number == number {
-			return block, nil
-		}
-		if err != nil {
-			failures = append(failures, fmt.Errorf("parse block from upstream %s: %w", candidate.ID, err))
-		}
+	accepted, err := r.getRequiredHead(request.snapshot, head.Latest)
+	if err != nil {
+		return head.Head{}, err
 	}
-	if len(failures) > 0 {
-		return head.Head{}, errors.Join(fmt.Errorf("%w: block %s", ErrEVMBlockUnavailable, quantity), errors.Join(failures...))
+	if accepted.ReorgPending || number > accepted.Number {
+		return head.Head{}, fmt.Errorf("%w: block %s is outside the accepted snapshot", ErrEVMBlockUnavailable, request.quantity)
 	}
-	return head.Head{}, fmt.Errorf("%w: block %s", ErrEVMBlockUnavailable, quantity)
+	// A number lookup, even on the head's origin, can switch forks behind a load
+	// balancer. Only the accepted header's parent links select the same branch.
+	if r.Config.ReorgDepth < 0 || accepted.Number-number > uint64(r.Config.ReorgDepth) {
+		return head.Head{}, fmt.Errorf("%w: block %s exceeds the ancestry window; use an explicit block hash", ErrEVMBlockUnavailable, request.quantity)
+	}
+	ancestryCtx, cancel := context.WithTimeout(ctx, r.Config.HeadRequestTimeout.Value())
+	defer cancel()
+	cursor := accepted
+	for cursor.Number > number {
+		parent, err := r.EVMBlockByHash(ancestryCtx, EVMBlockByHashRequest{Hash: cursor.ParentHash, Commitment: "explicit", PreferredUpstreamID: cursor.Origin})
+		if err != nil {
+			return head.Head{}, fmt.Errorf("%w: get ancestor of block %s: %w", ErrEVMBlockUnavailable, request.quantity, err)
+		}
+		if parent.Number != cursor.Number-1 {
+			return head.Head{}, fmt.Errorf("%w: discontinuous ancestry for block %s", ErrEVMBlockUnavailable, request.quantity)
+		}
+		cursor = parent
+	}
+	cursor.Commitment = "explicit"
+	return cursor, nil
 }
 
 func (r *Runtime) getRequiredHead(snapshot head.Snapshot, commitment string) (head.Head, error) {
@@ -376,7 +386,9 @@ func (r *Runtime) HasEVMBlock(ctx context.Context, candidate *upstream.Client, t
 	if target.Hash == "" {
 		return false, errors.New("target block hash is required")
 	}
-	key := candidate.ID + ":evm:" + target.Hash
+	// Hash-only checks must not satisfy stricter coordinator checks of a header's
+	// height and parent. These constraints are part of the probe's identity.
+	key := r.getEVMAvailabilityKey(candidate.ID, target)
 	return r.probe(ctx, key, func(probeCtx context.Context) (bool, error) {
 		blockCall, err := r.call(probeCtx, candidate, "eth_getBlockByHash", target.Hash, false)
 		if err != nil {
@@ -546,8 +558,12 @@ func (r *Runtime) getCachedAvailability(key string) (bool, bool) {
 func (r *Runtime) InvalidateAvailability(candidateID string, target head.Head) {
 	r.availabilityMu.Lock()
 	defer r.availabilityMu.Unlock()
-	delete(r.availability, candidateID+":evm:"+target.Hash)
+	delete(r.availability, r.getEVMAvailabilityKey(candidateID, target))
 	delete(r.availability, fmt.Sprintf("%s:solana:%s:%d", candidateID, target.Commitment, target.Number))
+}
+
+func (r *Runtime) getEVMAvailabilityKey(candidateID string, target head.Head) string {
+	return fmt.Sprintf("%s:evm:%s:%s:%d:%s", candidateID, target.Hash, target.Commitment, target.Number, target.ParentHash)
 }
 
 // ParseEVMHead validates an upstream header and adds this runtime's chain identity and observation time.

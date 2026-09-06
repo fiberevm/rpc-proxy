@@ -16,6 +16,7 @@ import (
 	"github.com/fiberevm/rpc-proxy/internal/config"
 	"github.com/fiberevm/rpc-proxy/internal/head"
 	"github.com/fiberevm/rpc-proxy/internal/jsonrpc"
+	"github.com/fiberevm/rpc-proxy/internal/services/requestcache"
 	"github.com/fiberevm/rpc-proxy/internal/telemetry"
 )
 
@@ -174,7 +175,8 @@ func newSolanaTestGateway(t *testing.T, upstreams []config.UpstreamConfig) (*Gat
 	}
 	cancel()
 	store := head.NewMemoryStore()
-	proxy := NewGateway(Options{Config: cfg, Store: store, Runtimes: map[string]*chain.Runtime{"solana": runtime}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Telemetry: tel})
+	responseCache := requestcache.NewService(requestcache.Options{Config: config.CacheConfig{MaxEntries: 32, MaxBytes: 1 << 20, MaxEntryBytes: 1 << 16, TTL: config.Duration(time.Minute)}, LoadTimeout: time.Second})
+	proxy := NewGateway(Options{Config: cfg, Store: store, Runtimes: map[string]*chain.Runtime{"solana": runtime}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Telemetry: tel, Cache: responseCache})
 	return proxy, store
 }
 

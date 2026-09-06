@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/fiberevm/rpc-proxy/internal/utils"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,7 +32,17 @@ type Config struct {
 	Server  ServerConfig  `yaml:"server"`
 	Redis   RedisConfig   `yaml:"redis"`
 	Datadog DatadogConfig `yaml:"datadog"`
+	Cache   CacheConfig   `yaml:"cache"`
 	Chains  []ChainConfig `yaml:"chains"`
+}
+
+// CacheConfig bounds the process-local cache of verified RPC results and ancestry headers.
+type CacheConfig struct {
+	Disabled      bool     `yaml:"disabled"`
+	MaxEntries    int      `yaml:"max_entries"`
+	MaxBytes      int      `yaml:"max_bytes"`
+	MaxEntryBytes int      `yaml:"max_entry_bytes"`
+	TTL           Duration `yaml:"ttl"`
 }
 
 type ServerConfig struct {
@@ -113,6 +124,18 @@ func Load(path string) (*Config, error) {
 }
 
 func (cfg *Config) applyDefaults() {
+	if cfg.Cache.MaxEntries == 0 {
+		cfg.Cache.MaxEntries = 4096
+	}
+	if cfg.Cache.MaxBytes == 0 {
+		cfg.Cache.MaxBytes = 64 << 20
+	}
+	if cfg.Cache.MaxEntryBytes == 0 {
+		cfg.Cache.MaxEntryBytes = 1 << 20
+	}
+	if cfg.Cache.TTL == 0 {
+		cfg.Cache.TTL = Duration(5 * time.Minute)
+	}
 	if cfg.Server.ListenAddress == "" {
 		cfg.Server.ListenAddress = ":8080"
 	}
@@ -217,6 +240,9 @@ func (cfg *Config) getEnvironmentValues() error {
 // Validate checks all service, chain, and upstream settings before any runtime dependency is constructed.
 func (cfg *Config) Validate() error {
 	var problems []error
+	if cfg.Cache.MaxEntries <= 0 || cfg.Cache.MaxBytes <= 0 || cfg.Cache.MaxEntryBytes <= 0 || cfg.Cache.MaxEntryBytes > cfg.Cache.MaxBytes || cfg.Cache.TTL.Value() <= 0 {
+		problems = append(problems, errors.New("cache limits and ttl must be positive; max_entry_bytes must not exceed max_bytes"))
+	}
 	if cfg.Server.RequestTimeout.Value() <= 0 {
 		problems = append(problems, errors.New("server request_timeout must be positive"))
 	}
@@ -247,8 +273,10 @@ func (cfg *Config) Validate() error {
 		if chain.Family != "evm" && chain.Family != "solana" {
 			problems = append(problems, fmt.Errorf("chain %q: family must be evm or solana", chain.Name))
 		}
-		if chain.Family == "evm" && chain.ChainID == "" {
-			problems = append(problems, fmt.Errorf("chain %q: chain_id is required", chain.Name))
+		if chain.Family == "evm" {
+			if _, err := utils.ParseEVMQuantity(chain.ChainID); err != nil {
+				problems = append(problems, fmt.Errorf("chain %q: invalid chain_id: %w", chain.Name, err))
+			}
 		}
 		if chain.Family == "solana" && chain.GenesisHash == "" {
 			problems = append(problems, fmt.Errorf("chain %q: genesis_hash is required", chain.Name))
