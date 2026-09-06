@@ -1,0 +1,39 @@
+# Default container configuration for Kubernetes, Render, and Railway.
+# Supply credentials through the declared environment variables.
+server:
+  listen_address: ":8080"
+  # Reachable by private health probes; publish only port 8080 at the ingress.
+  admin_address: ":8081"
+  request_timeout: 5s
+
+redis:
+  url_env: REDIS_URL
+  key_prefix: rpc-proxy
+  leader_ttl: 5s
+  stream_max_length: 4096
+
+datadog:
+  enabled: false
+
+# Start with two Ethereum mainnet providers. Extend this list using
+# config.example.yaml for other EVM chains, Solana, or additional providers.
+chains:
+  - name: ethereum
+    family: evm
+    chain_id: "0x1"
+    block_time: 12s
+    poll_interval: 2s
+    head_request_timeout: 2s
+    websocket_idle_timeout: 20s
+    max_head_age: 30s
+    reorg_depth: 64
+    upstreams:
+      - id: provider-a
+        http_url_env: ETHEREUM_PROVIDER_A_HTTP_URL
+        # Optional: uncomment and supply the variable to follow newHeads.
+        # websocket_url_env: ETHEREUM_PROVIDER_A_WS_URL
+        max_concurrency: 256
+      - id: provider-b
+        http_url_env: ETHEREUM_PROVIDER_B_HTTP_URL
+        # websocket_url_env: ETHEREUM_PROVIDER_B_WS_URL
+        max_concurrency: 256

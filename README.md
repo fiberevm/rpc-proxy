@@ -4,6 +4,12 @@
 
 Made by [Fiber](https://github.com/fiberevm).
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2Ffiberevm%2Frpc-proxy)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ffiberevm%2Frpc-proxy%2Ftree%2Fmain%2Fdeploy%2Fvercel&env=RPC_PROXY_ORIGIN&envDescription=HTTPS%20origin%20of%20your%20running%20RPC%20Proxy%20backend%2C%20without%20a%20trailing%20slash&project-name=rpc-proxy-http&repository-name=rpc-proxy-http)
+
+Render deploys the full service with Redis. Railway opens project setup. Vercel deploys an HTTP forwarding endpoint and requires an existing backend. See the [deployment guide](docs/deployment.md), including the [Kubernetes template](deploy/kubernetes.yaml).
+
 **Exact-block EVM reads across RPC providers.**
 
 RPC providers can lag behind each other. RPC Proxy picks a verified block for each request. Supported EVM state reads use that exact block hash.
@@ -12,7 +18,7 @@ If a provider cannot serve it, the proxy tries another or waits for it to catch 
 
 Supports EVM and Solana, with many chains and providers. Redis shares the accepted head across proxy instances.
 
-[Quick start](#run-locally) · [Consistency](#consistency-contract) · [Reorgs](#reorg-protection) · [Operations](#operational-notes) · [Tests](#verification)
+[Quick start](#run-locally) · [Deploy](docs/deployment.md) · [Consistency](#consistency-contract) · [Reorgs](#reorg-protection) · [Operations](#operational-notes) · [Tests](#verification)
 
 ## Run locally
 

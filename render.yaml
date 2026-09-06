@@ -1,0 +1,37 @@
+# Render Blueprint: an always-on Docker service and private shared head store.
+# Review the paid compute plans before deploying.
+services:
+  - type: web
+    name: rpc-proxy
+    runtime: docker
+    plan: 0.5c-512mb
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Template users opt into updates instead of tracking every upstream push.
+    autoDeployTrigger: "off"
+    numInstances: 1
+    maxShutdownDelaySeconds: 30
+    # Render uses TCP health checks on PORT. HTTP readiness is private on 8081,
+    # so /health/ready must not be configured as a public healthCheckPath.
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: rpc-proxy-redis
+          property: connectionString
+      - key: ETHEREUM_PROVIDER_A_HTTP_URL
+        sync: false
+      - key: ETHEREUM_PROVIDER_B_HTTP_URL
+        sync: false
+
+  - type: keyvalue
+    name: rpc-proxy-redis
+    plan: 256mb
+    region: oregon
+    ipAllowList: []
+    # Head and reorg records are coordination state, not disposable cache keys.
+    maxmemoryPolicy: noeviction
+    persistenceMode: journal-snapshot
