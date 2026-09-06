@@ -6,4 +6,3 @@ bin
 coverage.out
 rpc-proxy.yaml
 *.prof
-**/.vercel

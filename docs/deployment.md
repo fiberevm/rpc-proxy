@@ -1,6 +1,6 @@
 # Deployment templates
 
-Kubernetes, Render, and Railway run the complete Go service, including background head coordination and WebSocket subscriptions. Vercel provides an optional HTTP forwarding endpoint for an already-running backend.
+Kubernetes, Render, and Railway run the complete Go service, including background head coordination and WebSocket subscriptions.
 
 ## Container configuration
 
@@ -53,6 +53,8 @@ Render's [default TCP health check](https://render.com/docs/health-checks) check
 
 The [Blueprint specification](https://render.com/docs/blueprint-spec) describes plan, scaling, and environment-variable overrides.
 
+When forking or relocating the template, update the repository URL in the Render button. The linked repository must contain the template files before the button can deploy them.
+
 ## Railway
 
 [railway.json](../railway.json) configures the Docker build, one replica, and restart-on-failure behavior. The README button opens Railway's project creation flow; it is not a published multi-service template link.
@@ -66,11 +68,3 @@ The [Blueprint specification](https://render.com/docs/blueprint-spec) describes 
 The template leaves Railway's public HTTP health check unset because readiness is served only on private port `8081`. Deployment activation therefore does not guarantee RPC readiness; monitor the private admin endpoint. Do not enable app sleeping for the persistent coordinator.
 
 For a reusable stack button, [create a Railway template](https://docs.railway.com/templates/create) containing the proxy, Redis, and these variables, then replace the README button's `https://railway.com/new` URL with Railway's generated template URL. `railway.json` configures a service; it does not create the database, variables, domain, or a Railway template ID.
-
-## Vercel
-
-The **Deploy with Vercel** button deploys [deploy/vercel](../deploy/vercel/README.md). It requires `RPC_PROXY_ORIGIN`, the HTTPS origin of a backend already running on Render, Railway, or Kubernetes.
-
-Vercel's request-scoped functions are unsuitable for this service's persistent coordinator and WebSocket server. The template instead emits an [external HTTP rewrite](https://vercel.com/docs/rewrites) for `POST /rpc/{chain}` with caching disabled. Use the backend directly for WebSocket subscriptions. Authentication and rate limiting remain ingress responsibilities.
-
-When forking or relocating these templates, update the repository URLs in the Render and Vercel buttons. The linked repository must contain these files before the buttons can deploy them.
