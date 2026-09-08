@@ -19,6 +19,8 @@ EVM freshness and lag monitors should cover `commitment:latest` only. Remove leg
 - **Latency SLO:** p99 `rpc_proxy.request.duration` above the chain-specific upstream budget for ten minutes.
 - **Error SLO:** consistency and upstream failures exceed the service's configured error-budget burn-rate thresholds.
 
-Do not add block hashes, transaction hashes, addresses, request IDs, or client identifiers as tags.
+Do not add block hashes, transaction hashes, addresses, request IDs, or free-form client identifiers as tags. The proxy's `client` tag uses only configured application labels plus the bounded `anonymous` and `unknown` buckets.
+
+The dashboard's client filter applies to inbound request metrics and the RPC method usage widget. Provider and coordinator metrics describe shared work and remain independent of that filter. `rpc_proxy.client.method` counts attempts per parsed item, including notifications and cached or rejected calls; group by `{client,chain,method,transport}` to compare applications. It does not measure provider billing or successful calls.
 
 Enable percentile aggregation for the DogStatsD distribution metrics before using p95/p99 queries. `upstream.request.duration` includes reading and validating the response body. The `/status` field `metric_submission_errors` counts locally rejected metric submissions; UDP transport does not confirm Agent receipt.

@@ -114,13 +114,17 @@ func (g *Gateway) ServeRPC(w http.ResponseWriter, request *http.Request, chainNa
 		})
 		return
 	}
-	ctx, finish := g.telemetry.Span(ctx, "rpc.request", "chain:"+chainName, "family:"+runtime.Config.Family)
+	client := g.getClient(request)
+	ctx, finish := g.telemetry.Span(ctx, "rpc.request", "chain:"+chainName, "family:"+runtime.Config.Family, "client:"+client)
+	for _, rpcRequest := range requests {
+		g.recordClientMethod(ctx, clientMethod{client: client, transport: "http", runtime: runtime, request: rpcRequest})
+	}
 	var requestErr error
 	outcome := "error"
 	defer func() {
 		finish(requestErr)
-		g.telemetry.Count("request", 1, "chain:"+chainName, "family:"+runtime.Config.Family, "outcome:"+outcome)
-		g.telemetry.Distribution("request.duration", float64(time.Since(started).Microseconds())/1000, "chain:"+chainName, "family:"+runtime.Config.Family)
+		g.telemetry.Count("request", 1, "chain:"+chainName, "family:"+runtime.Config.Family, "outcome:"+outcome, "client:"+client)
+		g.telemetry.Distribution("request.duration", float64(time.Since(started).Microseconds())/1000, "chain:"+chainName, "family:"+runtime.Config.Family, "client:"+client)
 	}()
 	var snapshot head.Snapshot
 	var snapshotErr error
@@ -580,6 +584,9 @@ func (g *Gateway) writeEnvelope(w http.ResponseWriter, requests []jsonrpc.Reques
 
 func (g *Gateway) metricMethod(method string, family string) string {
 	if family == "evm" {
+		if method == "eth_subscribe" || method == "eth_unsubscribe" {
+			return method
+		}
 		if _, ok := g.getEVMStateBlockIndex(method); ok {
 			return method
 		}

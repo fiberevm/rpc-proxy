@@ -1,0 +1,42 @@
+# Copy to rpc-proxy.yaml and replace this one URL with a multichain-enabled endpoint.
+# Any standard QuickNode network URL works as the source, including Base or Solana.
+quicknode:
+  http_url: "https://your-endpoint.quiknode.pro/YOUR_TOKEN/"
+  # Alternatively, omit http_url and set http_url_env: QUICKNODE_RPC_URL.
+  # id: quicknode
+  # max_concurrency: 256 # Per chain, not an account-wide QuickNode rate limit.
+  # websocket_disabled: true # Use EVM HTTP polling only.
+
+# Clients use X-RPC-Client: wallet or /rpc/ethereum?client=wallet.
+clients: [wallet, indexer]
+
+redis:
+  url: "redis://127.0.0.1:6379/0"
+
+datadog:
+  enabled: false # Enable to export client.method metrics; usage logs are always emitted.
+
+chains:
+  - name: ethereum
+    family: evm
+    chain_id: "0x1"
+    quicknode_network: mainnet
+    block_time: 12s
+    max_head_age: 30s
+    # Explicit upstreams can be added here alongside the generated QuickNode upstream.
+
+  - name: base
+    family: evm
+    chain_id: "0x2105"
+    quicknode_network: base-mainnet
+    block_time: 2s
+    poll_interval: 1s
+    max_head_age: 10s
+
+  - name: solana
+    family: solana
+    genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+    quicknode_network: solana-mainnet
+    block_time: 400ms
+    poll_interval: 400ms
+    max_head_age: 5s

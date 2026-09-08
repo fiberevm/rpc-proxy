@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"regexp"
 	"time"
 
+	"github.com/fiberevm/rpc-proxy/internal/services/quicknode"
 	"github.com/fiberevm/rpc-proxy/internal/utils"
 	"gopkg.in/yaml.v3"
 )
@@ -29,11 +31,22 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 func (d Duration) Value() time.Duration { return time.Duration(d) }
 
 type Config struct {
-	Server  ServerConfig  `yaml:"server"`
-	Redis   RedisConfig   `yaml:"redis"`
-	Datadog DatadogConfig `yaml:"datadog"`
-	Cache   CacheConfig   `yaml:"cache"`
-	Chains  []ChainConfig `yaml:"chains"`
+	Server    ServerConfig     `yaml:"server"`
+	Redis     RedisConfig      `yaml:"redis"`
+	Datadog   DatadogConfig    `yaml:"datadog"`
+	Cache     CacheConfig      `yaml:"cache"`
+	Chains    []ChainConfig    `yaml:"chains"`
+	QuickNode *QuickNodeConfig `yaml:"quicknode"`
+	Clients   []string         `yaml:"clients"`
+}
+
+// QuickNodeConfig supplies one shared RPC URL for chains with quicknode_network set.
+type QuickNodeConfig struct {
+	HTTPURL           string `yaml:"http_url"`
+	HTTPURLEnv        string `yaml:"http_url_env"`
+	ID                string `yaml:"id"`
+	MaxConcurrency    int    `yaml:"max_concurrency"`
+	WebsocketDisabled bool   `yaml:"websocket_disabled"`
 }
 
 // CacheConfig bounds the process-local cache of verified RPC results and ancestry headers.
@@ -73,6 +86,7 @@ type DatadogConfig struct {
 }
 
 type ChainConfig struct {
+	QuickNodeNetwork     string           `yaml:"quicknode_network"`
 	Name                 string           `yaml:"name"`
 	Family               string           `yaml:"family"`
 	ChainID              string           `yaml:"chain_id"`
@@ -113,10 +127,13 @@ func Load(path string) (*Config, error) {
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return nil, errors.New("config must contain exactly one YAML document")
 	}
-	cfg.applyDefaults()
 	if err := cfg.getEnvironmentValues(); err != nil {
 		return nil, err
 	}
+	if err := cfg.addQuickNodeUpstreams(); err != nil {
+		return nil, err
+	}
+	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -201,6 +218,12 @@ func (cfg *Config) applyDefaults() {
 }
 
 func (cfg *Config) getEnvironmentValues() error {
+	if cfg.QuickNode != nil && cfg.QuickNode.HTTPURL == "" && cfg.QuickNode.HTTPURLEnv != "" {
+		cfg.QuickNode.HTTPURL = os.Getenv(cfg.QuickNode.HTTPURLEnv)
+		if cfg.QuickNode.HTTPURL == "" {
+			return fmt.Errorf("environment variable %s for QuickNode http url is empty", cfg.QuickNode.HTTPURLEnv)
+		}
+	}
 	if cfg.Redis.URL == "" && cfg.Redis.URLEnv != "" {
 		cfg.Redis.URL = os.Getenv(cfg.Redis.URLEnv)
 		if cfg.Redis.URL == "" {
@@ -237,9 +260,54 @@ func (cfg *Config) getEnvironmentValues() error {
 	return nil
 }
 
+func (cfg *Config) addQuickNodeUpstreams() error {
+	var endpoints *quicknode.Service
+	if cfg.QuickNode != nil {
+		var err error
+		endpoints, err = quicknode.NewService(cfg.QuickNode.HTTPURL)
+		if err != nil {
+			return fmt.Errorf("configure QuickNode: %w", err)
+		}
+		if cfg.QuickNode.MaxConcurrency < 0 {
+			return errors.New("QuickNode max_concurrency must be positive")
+		}
+	}
+	for i := range cfg.Chains {
+		chain := &cfg.Chains[i]
+		if chain.QuickNodeNetwork == "" {
+			continue
+		}
+		if endpoints == nil {
+			return fmt.Errorf("chain %q: quicknode_network requires quicknode configuration", chain.Name)
+		}
+		urls, err := endpoints.GetEndpoints(chain.QuickNodeNetwork)
+		if err != nil {
+			return fmt.Errorf("chain %q: %w", chain.Name, err)
+		}
+		upstream := UpstreamConfig{ID: cfg.QuickNode.ID, HTTPURL: urls.HTTPURL, MaxConcurrency: cfg.QuickNode.MaxConcurrency}
+		if upstream.ID == "" {
+			upstream.ID = "quicknode"
+		}
+		if chain.Family == "evm" && !cfg.QuickNode.WebsocketDisabled {
+			upstream.WebsocketURL = urls.WebsocketURL
+		}
+		chain.Upstreams = append(chain.Upstreams, upstream)
+	}
+	return nil
+}
+
 // Validate checks all service, chain, and upstream settings before any runtime dependency is constructed.
 func (cfg *Config) Validate() error {
 	var problems []error
+	// Client names become Datadog tags; allow only explicitly configured bounded labels.
+	clientPattern := regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
+	seenClients := make(map[string]bool, len(cfg.Clients))
+	for _, client := range cfg.Clients {
+		if !clientPattern.MatchString(client) || client == "anonymous" || client == "unknown" || seenClients[client] {
+			problems = append(problems, fmt.Errorf("client %q must be a unique lowercase label of 1-64 characters; anonymous and unknown are reserved", client))
+		}
+		seenClients[client] = true
+	}
 	if cfg.Cache.MaxEntries <= 0 || cfg.Cache.MaxBytes <= 0 || cfg.Cache.MaxEntryBytes <= 0 || cfg.Cache.MaxEntryBytes > cfg.Cache.MaxBytes || cfg.Cache.TTL.Value() <= 0 {
 		problems = append(problems, errors.New("cache limits and ttl must be positive; max_entry_bytes must not exceed max_bytes"))
 	}

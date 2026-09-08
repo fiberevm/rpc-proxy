@@ -1,18 +1,22 @@
 {
   "title": "Consistent RPC Proxy",
-  "description": "Freshness, consistency, upstream health, and WebSocket recovery for rpc-proxy.",
+  "description": "Client method usage, freshness, consistency, upstream health, and WebSocket recovery for rpc-proxy.",
   "layout_type": "ordered",
   "template_variables": [
     {"name": "env", "prefix": "env", "default": "*"},
-    {"name": "chain", "prefix": "chain", "default": "*"}
+    {"name": "chain", "prefix": "chain", "default": "*"},
+    {"name": "client", "prefix": "client", "default": "*"}
   ],
   "widgets": [
     {"definition": {"type": "timeseries", "title": "Requests and errors", "requests": [
-      {"q": "sum:rpc_proxy.request{env:$env,chain:$chain}.as_rate()", "display_type": "line"},
-      {"q": "sum:rpc_proxy.request{env:$env,chain:$chain,outcome:error}.as_rate()", "display_type": "line"}
+      {"q": "sum:rpc_proxy.request{env:$env,chain:$chain,client:$client}.as_rate()", "display_type": "line"},
+      {"q": "sum:rpc_proxy.request{env:$env,chain:$chain,client:$client,outcome:error}.as_rate()", "display_type": "line"}
+    ]}},
+    {"definition": {"type": "timeseries", "title": "RPC method attempts by client", "requests": [
+      {"q": "sum:rpc_proxy.client.method{env:$env,chain:$chain,client:$client} by {client,chain,method,transport}.as_count()", "display_type": "bars"}
     ]}},
     {"definition": {"type": "timeseries", "title": "Request and pin latency p99", "requests": [
-      {"q": "p99:rpc_proxy.request.duration{env:$env,chain:$chain}", "display_type": "line"},
+      {"q": "p99:rpc_proxy.request.duration{env:$env,chain:$chain,client:$client}", "display_type": "line"},
       {"q": "p99:rpc_proxy.pin.wait{env:$env,chain:$chain}", "display_type": "line"}
     ]}},
     {"definition": {"type": "timeseries", "title": "Accepted head age", "requests": [

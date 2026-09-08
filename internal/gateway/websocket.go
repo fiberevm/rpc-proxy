@@ -20,6 +20,7 @@ import (
 )
 
 type wsSession struct {
+	client      string
 	gateway     *Gateway
 	runtime     *chain.Runtime
 	conn        *websocket.Conn
@@ -48,12 +49,13 @@ func (g *Gateway) WebsocketHandler() http.Handler {
 			return
 		}
 		ctx, cancel := context.WithCancel(request.Context())
-		session := &wsSession{gateway: g, runtime: runtime, conn: conn, ctx: ctx, cancel: cancel, writes: make(chan []byte, g.config.Server.WebsocketQueueSize), subs: map[string]bool{}}
-		g.telemetry.Count("ws.connection", 1, "chain:"+chainName, "state:opened")
+		client := g.getClient(request)
+		session := &wsSession{client: client, gateway: g, runtime: runtime, conn: conn, ctx: ctx, cancel: cancel, writes: make(chan []byte, g.config.Server.WebsocketQueueSize), subs: map[string]bool{}}
+		g.telemetry.Count("ws.connection", 1, "chain:"+chainName, "state:opened", "client:"+client)
 		defer func() {
 			cancel()
 			conn.CloseNow()
-			g.telemetry.Count("ws.connection", 1, "chain:"+chainName, "state:closed")
+			g.telemetry.Count("ws.connection", 1, "chain:"+chainName, "state:closed", "client:"+client)
 		}()
 		go session.writeLoop()
 		session.readLoop()
@@ -71,6 +73,7 @@ func (s *wsSession) readLoop() {
 			s.enqueueResponse(jsonrpc.Failure(nil, jsonrpc.ParseError(err.Error())))
 			continue
 		}
+		s.gateway.recordClientMethod(s.ctx, clientMethod{client: s.client, transport: "websocket", runtime: s.runtime, request: request})
 		if rpcErr := request.Validate(); rpcErr != nil {
 			s.enqueueResponse(jsonrpc.Failure(request.ID, rpcErr))
 			continue

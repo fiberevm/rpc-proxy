@@ -1,5 +1,8 @@
 # Copy to rpc-proxy.yaml and replace the example provider URLs with your endpoints.
 # Keep real credentials in that ignored local file, not in this committed example.
+# For one QuickNode multichain URL, see config.quicknode.example.yaml.
+# Optional bounded client labels; callers send X-RPC-Client or ?client=.
+# clients: [wallet, indexer]
 server:
   listen_address: ":8080"
   admin_address: "127.0.0.1:8081"

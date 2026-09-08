@@ -61,6 +61,64 @@ curl http://127.0.0.1:8080/rpc/ethereum \
 
 See [config.example.yaml](config.example.yaml) for all settings. Restart after config changes.
 
+## QuickNode multichain
+
+Use [config.quicknode.example.yaml](config.quicknode.example.yaml) to configure several chains with one QuickNode RPC URL. Enable Multichain on that endpoint in the QuickNode dashboard first, following [QuickNode's multichain guide](https://www.quicknode.com/guides/quicknode-products/how-to-use-multichain-endpoint).
+
+```yaml
+quicknode:
+  http_url: "https://your-endpoint.base-mainnet.quiknode.pro/YOUR_TOKEN/"
+
+chains:
+  - name: ethereum
+    family: evm
+    chain_id: "0x1"
+    quicknode_network: mainnet
+  - name: base
+    family: evm
+    chain_id: "0x2105"
+    quicknode_network: base-mainnet
+```
+
+Keep the usual Redis, timing, and telemetry settings. The shared URL can come from any standard QuickNode network endpoint. Each `quicknode_network` is the exact network slug from your dashboard; Ethereum mainnet uses `mainnet`, Solana uses `solana-mainnet`, and BNB Smart Chain uses `bsc`. Chains still need their configured EVM chain ID or Solana genesis hash, which startup checks against the provider.
+
+The proxy generates one upstream named `quicknode` per opted-in chain, reusing the endpoint name, token, and query parameters. It also generates EVM WebSocket URLs. Avalanche `avalanche-mainnet` and `avalanche-testnet` use `/ext/bc/C/rpc` for HTTP and [`/ext/bc/C/ws` for WebSocket](https://www.quicknode.com/docs/avalanche/eth_subscribe). Other custom domains or network-specific URL paths should use explicit `upstreams`.
+
+Set `quicknode.http_url_env` instead of `http_url` to load the shared URL from an environment variable. Optional `id`, `max_concurrency` (per chain, default 256), and `websocket_disabled` settings apply to the generated upstreams. Explicit upstreams remain available alongside QuickNode and must have distinct IDs. Chains without `quicknode_network` continue using their explicit upstreams.
+
+## Client method tracking
+
+Declare client labels in your config:
+
+```yaml
+clients: [wallet, indexer]
+```
+
+Send the label as a header or URL query parameter:
+
+```sh
+curl http://127.0.0.1:8080/rpc/ethereum \
+  -H 'Content-Type: application/json' \
+  -H 'X-RPC-Client: wallet' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}'
+# URL-only clients: http://127.0.0.1:8080/rpc/ethereum?client=wallet
+# Browser WebSockets: ws://127.0.0.1:8080/ws/ethereum?client=wallet
+```
+
+A nonempty `X-RPC-Client` header takes precedence over `?client=`. Labels must match configuration exactly and use 1–64 lowercase letters, digits, underscores, or hyphens, starting with a letter. Missing labels use `anonymous`; unregistered labels use `unknown`. Both names are reserved. Labels identify applications for telemetry; they do not authenticate callers.
+
+Datadog's `rpc_proxy.client.method` counter has `client`, `chain`, `family`, `method`, and `transport` (`http` or `websocket`) tags. To compare usage, query:
+
+```text
+sum:rpc_proxy.client.method{*} by {client,chain,method}.as_count()
+```
+
+The bundled [Datadog dashboard](deploy/datadog-dashboard.json) includes a client filter and RPC method usage chart.
+
+Each parsed RPC item on a configured chain counts once, including batch items, notifications, static replies, cache hits, rejected calls, and calls blocked by Redis failure. Upstream retries and WebSocket head notifications do not count as extra client requests. These are attempted-method counts, not success counts. Malformed envelopes and unknown chains are excluded. Supported methods retain their names; rejected writes, unknown methods, and invalid requests use the bounded `write`, `unknown`, and `invalid` method tags.
+
+Structured `rpc method requested` logs carry the same fields, including when Datadog is disabled. HTTP request metrics and request traces also carry the client tag, as do WebSocket connection metrics. Client labels never become cache keys or get forwarded to upstream providers.
+
 ## Consistency contract
 
 - **EVM:** supported state reads use a block hash with `requireCanonical: true`.
